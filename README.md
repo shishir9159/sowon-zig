@@ -1,87 +1,57 @@
-# Ashurbanipal
+# sowon-zig
 
+A Windows-first port of [sowon](https://github.com/tsoding/sowon) to pure Zig.
+No C dependencies, no OpenGL, no asset files: the digits are seven-segment
+shapes drawn with GDI, and the end-of-timer chime is synthesized at startup.
 
-## installation
+## Build
 
-For Red Hat Enterprise Linux 9.4 (Plow) and kernel version 5.14.0-427.76.1.el9_4.x86_64:
+Requires Zig 0.14 or newer (tested style targets 0.14/0.15). On Windows:
 
-```Bash
-# Install the repository RPM:
-sudo dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-8-x86_64/pgdg-redhat-repo-latest.noarch.rpm
-
-# Disable the built-in PostgreSQL module:
-sudo dnf -qy module disable postgresql
-
-# Install PostgreSQL, developer toolkit(vector), contribution(citext):
-sudo dnf install -y postgresql18-server postgresql-devel postgresql18-contrib
-
-# Optionally initialize the database and enable automatic start:
-sudo /usr/pgsql-18/bin/postgresql-18-setup initdb
-sudo systemctl enable postgresql-18
-sudo systemctl start postgresql-18
-sudo systemctl status postgresql-18
+```console
+> cd sowon-zig
+> zig build -Doptimize=ReleaseSafe
+> .\zig-out\bin\sowon.exe 25m
 ```
 
-```Bash
-sudo rpm -i https://ftp.postgresql.org/pub/pgadmin/pgadmin4/yum/pgadmin4-fedora-repo-2-1.noarch.rpm
+## Usage
 
-```
+| Command | Meaning |
+| --- | --- |
+| `sowon` | clock mode (local time) |
+| `sowon clock` | clock mode, explicit |
+| `sowon 25m` | 25-minute countdown |
+| `sowon 1h30m`, `sowon 90s`, `sowon 1.5h` | duration units combine like the original |
 
-## Post-installation
+| Key | Description |
+| --- | --- |
+| <kbd>SPACE</kbd> | pause / resume (timer mode; digits turn red while paused) |
+| <kbd>ESC</kbd> | quit |
 
-Due to policies for Red Hat family distributions, the PostgreSQL installation will not be enabled for automatic start or have the database initialized automatically. Following steps will: 
+## Focus tracking
 
-```Bash
-postgresql-18-setup initdb
-# systemctl enable postgresql.service
-# systemctl start postgresql.service
-```
+In timer mode the app samples the foreground window once per second and
+records which executable owns it (`chrome.exe`, `explorer.exe`, `Code.exe`,
+...). Sampling pauses while the timer is paused.
 
-sudo yum install pgvector_18
+When the countdown reaches zero:
 
-## PG Admin
+1. a rising C-major chime plays (synthesized, no sound file needed),
+2. the window switches to a per-app usage report sorted by time,
+3. the same report is printed to the console if you launched from one.
 
-```Bash
-sudo curl https://www.pgadmin.org/static/packages_pgadmin_org.pub | sudo tee /etc/pki/rpm-gpg/pgadmin.asc
-sudo rpm --import /etc/pki/rpm-gpg/pgadmin.asc
+Notes on Windows quirks:
 
-sudo tee /etc/yum.repos.d/pgadmin4.repo <<EOF
-[pgAdmin4]
-name=pgAdmin4 Repository
-baseurl=https://ftp.postgresql.org/pub/pgadmin/pgadmin4/yum/redhat/rhel-8-x86_64
-enabled=1
-gpgcheck=1
-gpgkey=file:///etc/pki/rpm-gpg/pgadmin.asc
-EOF
+- Store/UWP apps may show up as `ApplicationFrameHost.exe`.
+- Seconds with no focused window (e.g. on the lock screen) are recorded
+  under `(no focused window)`.
 
-sudo yum install pgadmin4-web
-```
+## Chrome tabs / tab groups
 
-
-```Bash
-bash /usr/pgadmin4/bin/setup-web.sh
-```
-
-update the value for DEFAULT_SERVER from '127.0.0.1' to '0.0.0.0' approximately from the /usr/pgadmin4/web/config.py file and restart apache server with the following command:
-```Bash
-sed
-
-```
-
-
-# creating user and password
-
-```Bash
-sudo -i -u postgres
-psql
-```
-
-```psql
-CREATE ROLE shishir WITH LOGIN PASSWORD 'shishir';
-CREATE DATABASE test OWNER shishir;
-GRANT ALL PRIVILEGES ON DATABASE test TO shishir;
-```
-
-extension "vector"
-
-yum install -y make 
+Per-tab and tab-group tracking is **not** possible from the outside: Chrome
+does not expose the active tab or `tabGroups` to other processes. The planned
+follow-up is a small Chrome extension (`chrome.tabs` + `chrome.tabGroups` +
+native messaging to this app). Until then, Chrome is tracked as one app like
+everything else. A zero-setup middle ground — reading the focused Chrome
+window's title, which equals the active tab's page title — is possible if
+wanted later.

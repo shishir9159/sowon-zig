@@ -1,7 +1,0 @@
-#!/bin/bash
-export POSTGRES_USER="postgres"
-export APP_DB_NAME="flash-attention"
-export BACKEND_APP_DB_USER="postgres"
-export AI_SYSTEM_DB_USER="postgres"
-export BACKEND_APP_DB_PASSWORD="nuxtaku"
-export AI_SYSTEM_DB_PASSWORD="nuxtaku"

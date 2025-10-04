@@ -1,5 +1,0 @@
-INSERT INTO
-    users
-    (id, name, email, password_hash)
-VALUES
-    ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'john.doe', 'john.doe@example.com', '\x013d7d16d7ad4fefb61bd95b765c8ceb');

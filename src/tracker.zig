@@ -1,7 +1,3 @@
-//! Foreground-app usage tracker. Sampled once per second while the
-//! timer is running: reads the focused window's process executable
-//! name and accumulates seconds per app.
-
 const std = @import("std");
 const w32 = @import("win32.zig");
 
@@ -17,8 +13,6 @@ pub const Tracker = struct {
         return .{ .map = std.StringHashMap(u64).init(alloc) };
     }
 
-    /// Records one second of usage for whatever app owns the
-    /// foreground window right now.
     pub fn sample(self: *Tracker) !void {
         var buf: [512]u8 = undefined;
         const name = foregroundAppName(&buf);
@@ -31,7 +25,6 @@ pub const Tracker = struct {
         gop.value_ptr.* += 1;
     }
 
-    /// Entries sorted by usage, most-used first.
     pub fn sortedEntries(self: *const Tracker, alloc: std.mem.Allocator) ![]Entry {
         const out = try alloc.alloc(Entry, self.map.count());
         var it = self.map.iterator();
@@ -48,9 +41,6 @@ pub const Tracker = struct {
     }
 };
 
-/// Executable base name of the process owning the foreground window,
-/// e.g. "chrome.exe" or "explorer.exe". Never fails: unknowable states
-/// are reported under placeholder names so no second goes missing.
 fn foregroundAppName(buf: []u8) []const u8 {
     const hwnd = w32.GetForegroundWindow() orelse return "(no focused window)";
 

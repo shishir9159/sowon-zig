@@ -1,12 +1,11 @@
 # sowon-zig
 
 A Windows-first port of [sowon](https://github.com/tsoding/sowon) to pure Zig.
-No C dependencies, no OpenGL, no asset files: the digits are seven-segment
-shapes drawn with GDI, and the end-of-timer chime is synthesized at startup.
+No C dependencies, no OpenGL, and the end-of-timer chime is synthesized at startup.
 
 ## Build
 
-Requires Zig 0.11:
+Requires Zig 0.15 nightly:
 
 ```POWERSHELL
 > cd sowon-zig

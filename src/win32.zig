@@ -1,7 +1,3 @@
-//! Minimal hand-written Win32 bindings — only what sowon needs.
-//! Self-contained on purpose: no dependency on std.os.windows types,
-//! so it survives std churn between Zig releases.
-
 pub const BOOL = c_int;
 pub const WORD = u16;
 pub const DWORD = u32;
@@ -101,6 +97,38 @@ pub const FW_NORMAL: c_int = 400;
 pub const DEFAULT_CHARSET: DWORD = 1;
 pub const CLEARTYPE_QUALITY: DWORD = 5;
 
+// DIB / AlphaBlend
+pub const BITMAPINFOHEADER = extern struct {
+    biSize: DWORD,
+    biWidth: i32,
+    biHeight: i32,
+    biPlanes: WORD,
+    biBitCount: WORD,
+    biCompression: DWORD,
+    biSizeImage: DWORD,
+    biXPelsPerMeter: i32,
+    biYPelsPerMeter: i32,
+    biClrUsed: DWORD,
+    biClrImportant: DWORD,
+};
+
+pub const BITMAPINFO = extern struct {
+    bmiHeader: BITMAPINFOHEADER,
+    bmiColors: [1]u32,
+};
+
+pub const BLENDFUNCTION = extern struct {
+    BlendOp: u8,
+    BlendFlags: u8,
+    SourceConstantAlpha: u8,
+    AlphaFormat: u8,
+};
+
+pub const BI_RGB: DWORD = 0;
+pub const DIB_RGB_COLORS: UINT = 0;
+pub const AC_SRC_OVER: u8 = 0;
+pub const AC_SRC_ALPHA: u8 = 1;
+
 // PlaySound
 pub const SND_ASYNC: DWORD = 0x0001;
 pub const SND_NODEFAULT: DWORD = 0x0002;
@@ -177,6 +205,30 @@ pub extern "gdi32" fn CreateFontW(
     iPitchAndFamily: DWORD,
     pszFaceName: ?[*:0]const u16,
 ) callconv(.winapi) ?HFONT;
+
+pub extern "gdi32" fn CreateDIBSection(
+    hdc: ?HDC,
+    pbmi: *const BITMAPINFO,
+    usage: UINT,
+    ppvBits: *?*anyopaque,
+    hSection: ?HANDLE,
+    offset: DWORD,
+) callconv(.winapi) ?HBITMAP;
+
+// msimg32
+pub extern "msimg32" fn AlphaBlend(
+    hdcDest: HDC,
+    xoriginDest: c_int,
+    yoriginDest: c_int,
+    wDest: c_int,
+    hDest: c_int,
+    hdcSrc: HDC,
+    xoriginSrc: c_int,
+    yoriginSrc: c_int,
+    wSrc: c_int,
+    hSrc: c_int,
+    ftn: BLENDFUNCTION,
+) callconv(.winapi) BOOL;
 
 // kernel32
 pub extern "kernel32" fn GetModuleHandleW(?[*:0]const u16) callconv(.winapi) ?HINSTANCE;

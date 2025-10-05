@@ -1,11 +1,3 @@
-//! Synthesizes the end-of-timer chime as an in-memory WAV image
-//! (16-bit mono PCM), ready for PlaySoundW with SND_MEMORY.
-//!
-//! The sound is a rising C-major arpeggio (C5 E5 G5 C6) of bell-like
-//! tones: each note is a sine with a couple of harmonics under an
-//! exponentially decaying envelope. Short attack, long tail — the
-//! classic "achievement unlocked" shape.
-
 const std = @import("std");
 
 const sample_rate: u32 = 44100;

@@ -15,48 +15,25 @@
 const std = @import("std");
 const w32 = @import("win32.zig");
 const chime = @import("chime.zig");
+const digits = @import("digits.zig");
 const Tracker = @import("tracker.zig").Tracker;
 
 const L = std.unicode.utf8ToUtf16LeStringLiteral;
 
 const bg_color = w32.rgb(24, 24, 24);
 const main_color = w32.rgb(220, 220, 220);
-const pause_color = w32.rgb(220, 120, 120);
+const main_tint = [3]u8{ 220, 220, 220 };
+const pause_tint = [3]u8{ 220, 120, 120 };
 
 const chars_count = 8; // HH:MM:SS
-const char_aspect_w = 150;
-const char_aspect_h = 190;
 const max_display_secs = 99 * 3600 + 59 * 60 + 59;
+const wiggle_period_ms = 133; // = 0.40s / WIGGLE_COUNT, like the original
 
 const timer_id_tick: usize = 1; // repaint + countdown check, 100 ms
 const timer_id_track: usize = 2; // usage sampling, 1 s
 
 const Mode = enum { clock, timer };
 const Phase = enum { running, paused, finished };
-
-// Segment bits: A top, B top-right, C bottom-right, D bottom,
-// E bottom-left, F top-left, G middle.
-const seg_a: u8 = 1 << 0;
-const seg_b: u8 = 1 << 1;
-const seg_c: u8 = 1 << 2;
-const seg_d: u8 = 1 << 3;
-const seg_e: u8 = 1 << 4;
-const seg_f: u8 = 1 << 5;
-const seg_g: u8 = 1 << 6;
-
-const seg_table = [10]u8{
-    seg_a | seg_b | seg_c | seg_d | seg_e | seg_f, // 0
-    seg_b | seg_c, // 1
-    seg_a | seg_b | seg_g | seg_e | seg_d, // 2
-    seg_a | seg_b | seg_g | seg_c | seg_d, // 3
-    seg_f | seg_g | seg_b | seg_c, // 4
-    seg_a | seg_f | seg_g | seg_c | seg_d, // 5
-    seg_a | seg_f | seg_g | seg_e | seg_c | seg_d, // 6
-    seg_a | seg_b | seg_c, // 7
-    seg_a | seg_b | seg_c | seg_d | seg_e | seg_f | seg_g, // 8
-    seg_a | seg_b | seg_c | seg_d | seg_f | seg_g, // 9
-};
-const colon_index = 10;
 
 const App = struct {
     alloc: std.mem.Allocator,
@@ -250,64 +227,76 @@ fn updateTitle(hwnd: w32.HWND) void {
 
 // --- Rendering --------------------------------------------------------
 
-fn fillRect(hdc: w32.HDC, brush: w32.HBRUSH, left: i32, top: i32, right: i32, bottom: i32) void {
-    const rc = w32.RECT{ .left = left, .top = top, .right = right, .bottom = bottom };
-    _ = w32.FillRect(hdc, &rc, brush);
-}
+// One memory DC per tint, each holding the sprite sheet as a
+// premultiplied-alpha DIB. Created once in main, live for the process.
+var sprite_main: ?w32.HDC = null;
+var sprite_pause: ?w32.HDC = null;
 
-fn drawCell(hdc: w32.HDC, brush: w32.HBRUSH, x: i32, y: i32, cw: i32, ch: i32, digit: u8) void {
-    const pad = @divTrunc(cw, 10);
-    const x0 = x + pad;
-    const x1 = x + cw - pad;
-    const y0 = y + pad;
-    const y1 = y + ch - pad;
-    const t = @divTrunc(cw, 6); // segment thickness
-    const ym = @divTrunc(y0 + y1, 2);
+fn makeSpriteDc(tint: [3]u8) !w32.HDC {
+    var bi = std.mem.zeroes(w32.BITMAPINFO);
+    bi.bmiHeader.biSize = @sizeOf(w32.BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = digits.sheet_width;
+    bi.bmiHeader.biHeight = -@as(i32, digits.sheet_height); // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = w32.BI_RGB;
 
-    if (digit == colon_index) {
-        const cx = @divTrunc(x0 + x1, 2);
-        const third = @divTrunc(y1 - y0, 3);
-        const half = @divTrunc(t, 2);
-        fillRect(hdc, brush, cx - half, y0 + third - half, cx + half, y0 + third + half);
-        fillRect(hdc, brush, cx - half, y0 + 2 * third - half, cx + half, y0 + 2 * third + half);
-        return;
-    }
+    var bits: ?*anyopaque = null;
+    const bmp = w32.CreateDIBSection(null, &bi, w32.DIB_RGB_COLORS, &bits, null, 0) orelse
+        return error.CreateDIBSectionFailed;
+    const pixels: [*]u8 = @ptrCast(bits orelse return error.CreateDIBSectionFailed);
+    digits.writeTintedPremultiplied(pixels[0..digits.byte_len], tint);
 
-    const seg = seg_table[digit];
-    if (seg & seg_a != 0) fillRect(hdc, brush, x0, y0, x1, y0 + t);
-    if (seg & seg_g != 0) fillRect(hdc, brush, x0, ym - @divTrunc(t, 2), x1, ym + @divTrunc(t, 2));
-    if (seg & seg_d != 0) fillRect(hdc, brush, x0, y1 - t, x1, y1);
-    if (seg & seg_f != 0) fillRect(hdc, brush, x0, y0, x0 + t, ym);
-    if (seg & seg_b != 0) fillRect(hdc, brush, x1 - t, y0, x1, ym);
-    if (seg & seg_e != 0) fillRect(hdc, brush, x0, ym, x0 + t, y1);
-    if (seg & seg_c != 0) fillRect(hdc, brush, x1 - t, ym, x1, y1);
+    const dc = w32.CreateCompatibleDC(null) orelse return error.CreateDCFailed;
+    _ = w32.SelectObject(dc, bmp);
+    return dc;
 }
 
 fn drawClockFace(hdc: w32.HDC, width: i32, height: i32) void {
     const hms = displayedHms();
-    const digits = [chars_count]u8{
-        @intCast(hms[0] / 10), @intCast(hms[0] % 10), colon_index,
-        @intCast(hms[1] / 10), @intCast(hms[1] % 10), colon_index,
+    const columns = [chars_count]u8{
+        @intCast(hms[0] / 10), @intCast(hms[0] % 10), digits.colon_column,
+        @intCast(hms[1] / 10), @intCast(hms[1] % 10), digits.colon_column,
         @intCast(hms[2] / 10), @intCast(hms[2] % 10),
     };
+    // Same per-position wiggle phases as the original renderer.
+    const wiggle_offsets = [chars_count]u8{ 0, 1, 0, 2, 3, 1, 4, 5 };
+    const wiggle_index: u32 = @intCast(@mod(@divTrunc(nowMs(), wiggle_period_ms), digits.wiggle_count));
 
-    const color = if (app.phase == .paused) pause_color else main_color;
-    const brush = w32.CreateSolidBrush(color) orelse return;
-    defer _ = w32.DeleteObject(brush);
+    const sprite_dc = (if (app.phase == .paused) sprite_pause else sprite_main) orelse return;
 
-    // Fit HH:MM:SS into the client area, preserving cell aspect ratio.
+    // Fit HH:MM:SS into the client area, preserving glyph aspect ratio.
     var cell_h = height;
-    var cell_w = @divTrunc(cell_h * char_aspect_w, char_aspect_h);
+    var cell_w = @divTrunc(cell_h * digits.char_width, digits.char_height);
     if (cell_w * chars_count > width) {
         cell_w = @divTrunc(width, chars_count);
-        cell_h = @divTrunc(cell_w * char_aspect_h, char_aspect_w);
+        cell_h = @divTrunc(cell_w * digits.char_height, digits.char_width);
     }
     const pen_x = @divTrunc(width - cell_w * chars_count, 2);
     const pen_y = @divTrunc(height - cell_h, 2);
 
-    for (digits, 0..) |d, i| {
-        const x = pen_x + @as(i32, @intCast(i)) * cell_w;
-        drawCell(hdc, brush, x, pen_y, cell_w, cell_h, d);
+    const blend = w32.BLENDFUNCTION{
+        .BlendOp = w32.AC_SRC_OVER,
+        .BlendFlags = 0,
+        .SourceConstantAlpha = 255,
+        .AlphaFormat = w32.AC_SRC_ALPHA,
+    };
+
+    for (columns, wiggle_offsets, 0..) |col, wiggle_offset, i| {
+        const row = (wiggle_index + wiggle_offset) % digits.wiggle_count;
+        _ = w32.AlphaBlend(
+            hdc,
+            pen_x + @as(i32, @intCast(i)) * cell_w,
+            pen_y,
+            cell_w,
+            cell_h,
+            sprite_dc,
+            @as(i32, col) * digits.char_width,
+            @as(i32, @intCast(row)) * digits.char_height,
+            digits.char_width,
+            digits.char_height,
+            blend,
+        );
     }
 }
 
@@ -450,6 +439,9 @@ pub fn main(init: std.process.Init) !void {
         .tracker = Tracker.init(alloc),
         .chime_wav = try chime.buildWav(alloc),
     };
+
+    sprite_main = try makeSpriteDc(main_tint);
+    sprite_pause = try makeSpriteDc(pause_tint);
 
     const instance = w32.GetModuleHandleW(null);
     const class_name = L("sowon-zig");

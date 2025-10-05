@@ -241,6 +241,35 @@ pub extern "kernel32" fn QueryFullProcessImageNameW(HANDLE, DWORD, [*]u16, *DWOR
 // winmm
 pub extern "winmm" fn PlaySoundW(?*const anyopaque, ?HINSTANCE, DWORD) callconv(.winapi) BOOL;
 
+// Slim reader/writer lock (used exclusively; a plain mutex)
+pub const SRWLOCK = usize;
+pub const SRWLOCK_INIT: SRWLOCK = 0;
+pub extern "kernel32" fn AcquireSRWLockExclusive(*SRWLOCK) callconv(.winapi) void;
+pub extern "kernel32" fn ReleaseSRWLockExclusive(*SRWLOCK) callconv(.winapi) void;
+
+// winsock
+pub const SOCKET = usize;
+pub const INVALID_SOCKET: SOCKET = ~@as(SOCKET, 0);
+pub const AF_INET: u16 = 2;
+pub const SOCK_STREAM: c_int = 1;
+pub const IPPROTO_TCP: c_int = 6;
+
+pub const sockaddr_in = extern struct {
+    sin_family: u16,
+    sin_port: u16, // big-endian
+    sin_addr: u32, // network byte order in memory
+    sin_zero: [8]u8,
+};
+
+pub extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *anyopaque) callconv(.winapi) c_int;
+pub extern "ws2_32" fn socket(af: c_int, sock_type: c_int, protocol: c_int) callconv(.winapi) SOCKET;
+pub extern "ws2_32" fn bind(s: SOCKET, name: *const sockaddr_in, namelen: c_int) callconv(.winapi) c_int;
+pub extern "ws2_32" fn listen(s: SOCKET, backlog: c_int) callconv(.winapi) c_int;
+pub extern "ws2_32" fn accept(s: SOCKET, addr: ?*anyopaque, addrlen: ?*c_int) callconv(.winapi) SOCKET;
+pub extern "ws2_32" fn recv(s: SOCKET, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+pub extern "ws2_32" fn send(s: SOCKET, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+pub extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) c_int;
+
 pub fn rgb(r: u8, g: u8, b: u8) COLORREF {
     return @as(COLORREF, r) | (@as(COLORREF, g) << 8) | (@as(COLORREF, b) << 16);
 }

@@ -16,6 +16,7 @@ const std = @import("std");
 const w32 = @import("win32.zig");
 const chime = @import("chime.zig");
 const digits = @import("digits.zig");
+const server = @import("server.zig");
 const Tracker = @import("tracker.zig").Tracker;
 
 const L = std.unicode.utf8ToUtf16LeStringLiteral;
@@ -44,6 +45,7 @@ const App = struct {
     remaining_ms: i64, // frozen remainder while paused
     tracker: Tracker,
     chime_wav: []u8,
+    message: []const u8,
     report_lines: []const [:0]const u16 = &.{},
     last_title_sec: i64 = -1,
 };
@@ -60,6 +62,7 @@ fn nowMs() i64 {
 const Config = struct {
     mode: Mode,
     seconds: u64 = 0,
+    message: []const u8 = "Time's up!",
 };
 
 fn parseDuration(s: []const u8) !u64 {
@@ -88,21 +91,35 @@ fn parseDuration(s: []const u8) !u64 {
     return @intFromFloat(total);
 }
 
-fn parseArgs(args: []const [:0]const u8) Config {
-    if (args.len <= 1) return .{ .mode = .clock };
-    if (std.mem.eql(u8, args[1], "clock")) return .{ .mode = .clock };
+fn usageAndExit() noreturn {
+    std.debug.print(
+        \\usage:
+        \\  sowon                        clock mode
+        \\  sowon clock                  clock mode
+        \\  sowon 25m                    timer mode (also: 90s, 1.5h, 1h30m)
+        \\  sowon 25m -m "Take a walk"   message shown when the time runs out
+        \\
+    , .{});
+    std.process.exit(1);
+}
 
-    const seconds = parseDuration(args[1]) catch {
-        std.debug.print(
-            \\usage:
-            \\  sowon           clock mode
-            \\  sowon clock     clock mode
-            \\  sowon 25m       timer mode (also: 90s, 1.5h, 1h30m)
-            \\
-        , .{});
-        std.process.exit(1);
-    };
-    return .{ .mode = .timer, .seconds = seconds };
+fn parseArgs(args: []const [:0]const u8) Config {
+    var cfg = Config{ .mode = .clock };
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--message")) {
+            i += 1;
+            if (i >= args.len) usageAndExit();
+            cfg.message = args[i];
+        } else if (std.mem.eql(u8, arg, "clock")) {
+            cfg.mode = .clock;
+        } else {
+            cfg.seconds = parseDuration(arg) catch usageAndExit();
+            cfg.mode = .timer;
+        }
+    }
+    return cfg;
 }
 
 // --- Time & state -----------------------------------------------------
@@ -168,7 +185,7 @@ fn buildReport() !void {
     const session = try fmtDur(&session_buf, @intCast(@divTrunc(app.total_ms, 1000)));
     lines[0] = try std.unicode.utf8ToUtf16LeAllocZ(
         alloc,
-        try std.fmt.bufPrint(&buf, "Time's up!  Session length: {s}", .{session}),
+        try std.fmt.bufPrint(&buf, "{s}  (session: {s})", .{ app.message, session }),
     );
     lines[1] = try std.unicode.utf8ToUtf16LeAllocZ(alloc, "");
     lines[2] = try std.unicode.utf8ToUtf16LeAllocZ(alloc, "Foreground app usage:");
@@ -183,7 +200,7 @@ fn buildReport() !void {
     app.report_lines = lines;
 
     // Mirror the report to the console for terminal users.
-    std.debug.print("\n=== sowon: time's up! (session: {s}) ===\n", .{session});
+    std.debug.print("\n=== sowon: {s} (session: {s}) ===\n", .{ app.message, session });
     for (entries) |e| {
         const dur = fmtDur(&dur_buf, e.seconds) catch continue;
         std.debug.print("{s:>11}   {s}\n", .{ dur, e.name });
@@ -201,7 +218,17 @@ fn finishTimer(hwnd: w32.HWND) void {
     buildReport() catch |err| {
         std.debug.print("failed to build usage report: {}\n", .{err});
     };
-    _ = w32.SetWindowTextW(hwnd, L("Time's up! - sowon"));
+
+    // Show the custom message in the title bar, truncated if needed.
+    var tbuf: [128]u8 = undefined;
+    var wbuf: [128]u16 = undefined;
+    const head = app.message[0..@min(app.message.len, 80)];
+    if (std.fmt.bufPrint(&tbuf, "{s} - sowon", .{head})) |title| {
+        if (std.unicode.utf8ToUtf16Le(wbuf[0 .. wbuf.len - 1], title)) |n| {
+            wbuf[n] = 0;
+            _ = w32.SetWindowTextW(hwnd, wbuf[0..n :0]);
+        } else |_| {}
+    } else |_| {}
     _ = w32.InvalidateRect(hwnd, null, 0);
 }
 
@@ -438,10 +465,15 @@ pub fn main(init: std.process.Init) !void {
         .remaining_ms = total_ms,
         .tracker = Tracker.init(alloc),
         .chime_wav = try chime.buildWav(alloc),
+        .message = cfg.message,
     };
 
     sprite_main = try makeSpriteDc(main_tint);
     sprite_pause = try makeSpriteDc(pause_tint);
+
+    // Focus tracking wants browser detail; the listener is harmless if
+    // the extension never connects.
+    if (cfg.mode == .timer) server.start();
 
     const instance = w32.GetModuleHandleW(null);
     const class_name = L("sowon-zig");

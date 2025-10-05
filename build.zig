@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("gdi32", .{});
     exe.root_module.linkSystemLibrary("winmm", .{});
     exe.root_module.linkSystemLibrary("msimg32", .{});
+    exe.root_module.linkSystemLibrary("ws2_32", .{});
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

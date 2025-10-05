@@ -1,5 +1,6 @@
 const std = @import("std");
 const w32 = @import("win32.zig");
+const server = @import("server.zig");
 
 pub const Tracker = struct {
     map: std.StringHashMap(u64),
@@ -15,7 +16,14 @@ pub const Tracker = struct {
 
     pub fn sample(self: *Tracker) !void {
         var buf: [512]u8 = undefined;
-        const name = foregroundAppName(&buf);
+        var chrome_buf: [700]u8 = undefined;
+        var name = foregroundAppName(&buf);
+
+        // With the bell-bearer extension connected, split Chrome time
+        // by tab group and page title instead of lumping it together.
+        if (std.ascii.eqlIgnoreCase(name, "chrome.exe")) {
+            if (server.chromeContext(&chrome_buf)) |ctx| name = ctx;
+        }
 
         const gop = try self.map.getOrPut(name);
         if (!gop.found_existing) {

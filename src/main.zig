@@ -1,22 +1,9 @@
-//! sowon-zig — a minimal clock/timer for Windows, ported from
-//! tsoding/sowon (C + OpenGL) to pure Zig + Win32/GDI.
-//!
-//! Modes:
-//!   sowon             clock (local time)
-//!   sowon clock       clock (explicit)
-//!   sowon 25m         countdown timer (also 90s, 1.5h, 1h30m, ...)
-//!
-//! In timer mode the foreground app is sampled once per second; when
-//! the countdown hits zero a chime plays and the window switches to a
-//! per-app usage report.
-//!
-//! Keys: SPACE pause/resume (timer), ESC quit.
-
 const std = @import("std");
 const w32 = @import("win32.zig");
 const chime = @import("chime.zig");
 const digits = @import("digits.zig");
 const server = @import("server.zig");
+const db = @import("db.zig");
 const Tracker = @import("tracker.zig").Tracker;
 
 const L = std.unicode.utf8ToUtf16LeStringLiteral;
@@ -25,6 +12,7 @@ const bg_color = w32.rgb(24, 24, 24);
 const main_color = w32.rgb(220, 220, 220);
 const main_tint = [3]u8{ 220, 220, 220 };
 const pause_tint = [3]u8{ 220, 120, 120 };
+const break_tint = [3]u8{ 130, 210, 150 };
 
 const chars_count = 8; // HH:MM:SS
 const max_display_secs = 99 * 3600 + 59 * 60 + 59;
@@ -35,17 +23,28 @@ const timer_id_track: usize = 2; // usage sampling, 1 s
 
 const Mode = enum { clock, timer };
 const Phase = enum { running, paused, finished };
+const Kind = enum { work, brk };
 
 const App = struct {
     alloc: std.mem.Allocator,
     mode: Mode,
     phase: Phase,
-    total_ms: i64, // full timer length
+    kind: Kind = .work,
+    cycle: u32 = 1, // 1-based work-session counter
+    cycles_total: u32 = 1,
+    work_secs: u64 = 0,
+    break_secs: u64 = 0,
+    total_ms: i64, // length of the countdown currently running
     end_ms: i64, // deadline while running
     remaining_ms: i64, // frozen remainder while paused
     tracker: Tracker,
     chime_wav: []u8,
+    break_chime_wav: []u8,
     message: []const u8,
+    allow: []const []const u8 = &.{},
+    history: ?db.Db = null,
+    session_start_buf: [32]u8 = undefined,
+    session_start_len: usize = 0,
     report_lines: []const [:0]const u16 = &.{},
     last_title_sec: i64 = -1,
 };
@@ -57,12 +56,23 @@ fn nowMs() i64 {
     return @intCast(w32.GetTickCount64());
 }
 
+fn nowLocalString(buf: []u8) []const u8 {
+    var st: w32.SYSTEMTIME = undefined;
+    w32.GetLocalTime(&st);
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+    }) catch buf[0..0];
+}
+
 // --- Command line -----------------------------------------------------
 
 const Config = struct {
     mode: Mode,
     seconds: u64 = 0,
     message: []const u8 = "Time's up!",
+    repeats: u32 = 1,
+    break_seconds: u64 = 0,
+    allow: []const []const u8 = &.{},
 };
 
 fn parseDuration(s: []const u8) !u64 {
@@ -97,14 +107,24 @@ fn usageAndExit() noreturn {
         \\  sowon                        clock mode
         \\  sowon clock                  clock mode
         \\  sowon 25m                    timer mode (also: 90s, 1.5h, 1h30m)
-        \\  sowon 25m -m "Take a walk"   message shown when the time runs out
+        \\    -m "Take a walk"           message shown when the time runs out
+        \\    -r 4                       repeat: 4 work sessions (pomodoro)
+        \\    -b 5m                      break between work sessions
+        \\    -a explorer.exe            allow an app (or Chrome tab group)
+        \\                               in focus mode; repeatable
+        \\
+        \\Sessions are recorded to %LOCALAPPDATA%\sowon\sowon.db.
         \\
     , .{});
     std.process.exit(1);
 }
 
-fn parseArgs(args: []const [:0]const u8) Config {
+fn parseArgs(alloc: std.mem.Allocator, args: []const [:0]const u8) Config {
     var cfg = Config{ .mode = .clock };
+
+    var allow = alloc.alloc([]const u8, args.len) catch usageAndExit();
+    var allow_count: usize = 0;
+
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -112,6 +132,20 @@ fn parseArgs(args: []const [:0]const u8) Config {
             i += 1;
             if (i >= args.len) usageAndExit();
             cfg.message = args[i];
+        } else if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--repeat")) {
+            i += 1;
+            if (i >= args.len) usageAndExit();
+            cfg.repeats = std.fmt.parseInt(u32, args[i], 10) catch usageAndExit();
+            if (cfg.repeats < 1) usageAndExit();
+        } else if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--break")) {
+            i += 1;
+            if (i >= args.len) usageAndExit();
+            cfg.break_seconds = parseDuration(args[i]) catch usageAndExit();
+        } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--allow")) {
+            i += 1;
+            if (i >= args.len) usageAndExit();
+            allow[allow_count] = args[i];
+            allow_count += 1;
         } else if (std.mem.eql(u8, arg, "clock")) {
             cfg.mode = .clock;
         } else {
@@ -119,7 +153,42 @@ fn parseArgs(args: []const [:0]const u8) Config {
             cfg.mode = .timer;
         }
     }
+    cfg.allow = allow[0..allow_count];
     return cfg;
+}
+
+// --- Focus classification ----------------------------------------------
+
+/// True if this usage entry matches the allow list: either the app name
+/// itself ("explorer.exe") or, for entries the browser extension split
+/// by tab group ("chrome [Research] ..."), the group name.
+fn isAllowed(name: []const u8) bool {
+    for (app.allow) |pattern| {
+        if (std.ascii.eqlIgnoreCase(name, pattern)) return true;
+
+        const group_prefix = "chrome [";
+        if (std.mem.startsWith(u8, name, group_prefix)) {
+            const rest = name[group_prefix.len..];
+            if (std.mem.indexOfScalar(u8, rest, ']')) |end| {
+                if (std.ascii.eqlIgnoreCase(rest[0..end], pattern)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+const FocusSplit = struct { focused: u64, distracted: u64 };
+
+fn splitFocus(entries: []const Tracker.Entry) FocusSplit {
+    var split = FocusSplit{ .focused = 0, .distracted = 0 };
+    for (entries) |e| {
+        if (isAllowed(e.name)) {
+            split.focused += e.seconds;
+        } else {
+            split.distracted += e.seconds;
+        }
+    }
+    return split;
 }
 
 // --- Time & state -----------------------------------------------------
@@ -164,6 +233,78 @@ fn togglePause() void {
     }
 }
 
+fn startCountdown(secs: u64) void {
+    app.total_ms = @intCast(secs * 1000);
+    app.end_ms = nowMs() + app.total_ms;
+    app.remaining_ms = app.total_ms;
+    app.phase = .running;
+    app.last_title_sec = -1;
+}
+
+fn startWork(cycle: u32) void {
+    app.kind = .work;
+    app.cycle = cycle;
+    app.tracker = Tracker.init(app.alloc); // fresh stats per work session
+    app.report_lines = &.{};
+    app.session_start_len = nowLocalString(&app.session_start_buf).len;
+    startCountdown(app.work_secs);
+}
+
+fn startBreak() void {
+    app.kind = .brk;
+    startCountdown(app.break_secs);
+}
+
+fn playWav(wav: []u8) void {
+    _ = w32.PlaySoundW(wav.ptr, null, w32.SND_MEMORY | w32.SND_ASYNC | w32.SND_NODEFAULT);
+}
+
+/// Persists the just-finished work session to the history database.
+fn recordWorkSession() void {
+    if (app.history == null) return;
+    const entries = app.tracker.sortedEntries(app.alloc) catch return;
+
+    var rows = app.alloc.alloc(db.UsageRow, entries.len) catch return;
+    for (entries, 0..) |e, i| {
+        rows[i] = .{ .app = e.name, .seconds = e.seconds, .allowed = isAllowed(e.name) };
+    }
+    const split = splitFocus(entries);
+
+    app.history.?.recordSession(
+        app.session_start_buf[0..app.session_start_len],
+        app.work_secs,
+        app.message,
+        app.cycle,
+        split.focused,
+        split.distracted,
+        rows,
+    );
+}
+
+/// A countdown (work or break) reached zero.
+fn onCountdownDone(hwnd: w32.HWND) void {
+    switch (app.kind) {
+        .work => {
+            recordWorkSession();
+            if (app.cycle < app.cycles_total) {
+                playWav(app.chime_wav);
+                if (app.break_secs > 0) {
+                    startBreak();
+                } else {
+                    startWork(app.cycle + 1);
+                }
+            } else {
+                finishAll(hwnd);
+            }
+        },
+        .brk => {
+            playWav(app.break_chime_wav);
+            startWork(app.cycle + 1);
+        },
+    }
+    _ = w32.InvalidateRect(hwnd, null, 0);
+}
+
 fn fmtDur(buf: []u8, secs: u64) ![]const u8 {
     const h = secs / 3600;
     const m = secs / 60 % 60;
@@ -176,25 +317,53 @@ fn fmtDur(buf: []u8, secs: u64) ![]const u8 {
 fn buildReport() !void {
     const alloc = app.alloc;
     const entries = try app.tracker.sortedEntries(alloc);
+    const scored = app.allow.len > 0;
 
-    const lines = try alloc.alloc([:0]const u16, entries.len + 3);
+    const header_lines: usize = if (scored) 4 else 3;
+    const lines = try alloc.alloc([:0]const u16, entries.len + header_lines);
     var buf: [640]u8 = undefined;
     var dur_buf: [64]u8 = undefined;
 
     var session_buf: [64]u8 = undefined;
-    const session = try fmtDur(&session_buf, @intCast(@divTrunc(app.total_ms, 1000)));
-    lines[0] = try std.unicode.utf8ToUtf16LeAllocZ(
-        alloc,
-        try std.fmt.bufPrint(&buf, "{s}  (session: {s})", .{ app.message, session }),
-    );
+    const session = try fmtDur(&session_buf, app.work_secs);
+    if (app.cycles_total > 1) {
+        lines[0] = try std.unicode.utf8ToUtf16LeAllocZ(
+            alloc,
+            try std.fmt.bufPrint(&buf, "{s}  (session: {s}, cycle {d}/{d})", .{
+                app.message, session, app.cycle, app.cycles_total,
+            }),
+        );
+    } else {
+        lines[0] = try std.unicode.utf8ToUtf16LeAllocZ(
+            alloc,
+            try std.fmt.bufPrint(&buf, "{s}  (session: {s})", .{ app.message, session }),
+        );
+    }
     lines[1] = try std.unicode.utf8ToUtf16LeAllocZ(alloc, "");
-    lines[2] = try std.unicode.utf8ToUtf16LeAllocZ(alloc, "Foreground app usage:");
+
+    if (scored) {
+        const split = splitFocus(entries);
+        const tracked = split.focused + split.distracted;
+        const pct = if (tracked > 0) split.focused * 100 / tracked else 0;
+        var fbuf: [64]u8 = undefined;
+        var dbuf: [64]u8 = undefined;
+        const fs = try fmtDur(&fbuf, split.focused);
+        const ds = try fmtDur(&dbuf, split.distracted);
+        lines[2] = try std.unicode.utf8ToUtf16LeAllocZ(
+            alloc,
+            try std.fmt.bufPrint(&buf, "Focus score: {d}%  (focused {s} / distracted {s})", .{ pct, fs, ds }),
+        );
+        lines[3] = try std.unicode.utf8ToUtf16LeAllocZ(alloc, "Foreground app usage (+ = allowed):");
+    } else {
+        lines[2] = try std.unicode.utf8ToUtf16LeAllocZ(alloc, "Foreground app usage:");
+    }
 
     for (entries, 0..) |e, i| {
         const dur = try fmtDur(&dur_buf, e.seconds);
-        lines[3 + i] = try std.unicode.utf8ToUtf16LeAllocZ(
+        const mark: []const u8 = if (scored and isAllowed(e.name)) "+" else " ";
+        lines[header_lines + i] = try std.unicode.utf8ToUtf16LeAllocZ(
             alloc,
-            try std.fmt.bufPrint(&buf, "{s:>11}   {s}", .{ dur, e.name }),
+            try std.fmt.bufPrint(&buf, "{s:>11} {s} {s}", .{ dur, mark, e.name }),
         );
     }
     app.report_lines = lines;
@@ -203,18 +372,15 @@ fn buildReport() !void {
     std.debug.print("\n=== sowon: {s} (session: {s}) ===\n", .{ app.message, session });
     for (entries) |e| {
         const dur = fmtDur(&dur_buf, e.seconds) catch continue;
-        std.debug.print("{s:>11}   {s}\n", .{ dur, e.name });
+        const mark: []const u8 = if (scored and isAllowed(e.name)) "+" else " ";
+        std.debug.print("{s:>11} {s} {s}\n", .{ dur, mark, e.name });
     }
 }
 
-fn finishTimer(hwnd: w32.HWND) void {
+/// Final work session done: chime, report view, custom message.
+fn finishAll(hwnd: w32.HWND) void {
     app.phase = .finished;
-    _ = w32.KillTimer(hwnd, timer_id_track);
-    _ = w32.PlaySoundW(
-        app.chime_wav.ptr,
-        null,
-        w32.SND_MEMORY | w32.SND_ASYNC | w32.SND_NODEFAULT,
-    );
+    playWav(app.chime_wav);
     buildReport() catch |err| {
         std.debug.print("failed to build usage report: {}\n", .{err});
     };
@@ -238,15 +404,26 @@ fn updateTitle(hwnd: w32.HWND) void {
     if (sec_stamp == app.last_title_sec) return;
     app.last_title_sec = sec_stamp;
 
-    var buf: [64]u8 = undefined;
+    var cycle_buf: [24]u8 = undefined;
+    var cycle_part: []const u8 = "";
+    if (app.mode == .timer and app.cycles_total > 1) {
+        const kind_tag: []const u8 = if (app.kind == .brk) " break" else "";
+        cycle_part = std.fmt.bufPrint(&cycle_buf, "[{d}/{d}{s}] ", .{
+            app.cycle, app.cycles_total, kind_tag,
+        }) catch "";
+    } else if (app.mode == .timer and app.kind == .brk) {
+        cycle_part = "[break] ";
+    }
+
+    var buf: [96]u8 = undefined;
     const suffix = if (app.phase == .paused) " (paused)" else "";
     const title = std.fmt.bufPrint(
         &buf,
-        "{d:0>2}:{d:0>2}:{d:0>2}{s} - sowon",
-        .{ hms[0], hms[1], hms[2], suffix },
+        "{s}{d:0>2}:{d:0>2}:{d:0>2}{s} - sowon",
+        .{ cycle_part, hms[0], hms[1], hms[2], suffix },
     ) catch return;
 
-    var wbuf: [64]u16 = undefined;
+    var wbuf: [96]u16 = undefined;
     const n = std.unicode.utf8ToUtf16Le(wbuf[0 .. wbuf.len - 1], title) catch return;
     wbuf[n] = 0;
     _ = w32.SetWindowTextW(hwnd, wbuf[0..n :0]);
@@ -258,6 +435,7 @@ fn updateTitle(hwnd: w32.HWND) void {
 // premultiplied-alpha DIB. Created once in main, live for the process.
 var sprite_main: ?w32.HDC = null;
 var sprite_pause: ?w32.HDC = null;
+var sprite_break: ?w32.HDC = null;
 
 fn makeSpriteDc(tint: [3]u8) !w32.HDC {
     var bi = std.mem.zeroes(w32.BITMAPINFO);
@@ -290,7 +468,12 @@ fn drawClockFace(hdc: w32.HDC, width: i32, height: i32) void {
     const wiggle_offsets = [chars_count]u8{ 0, 1, 0, 2, 3, 1, 4, 5 };
     const wiggle_index: u32 = @intCast(@mod(@divTrunc(nowMs(), wiggle_period_ms), digits.wiggle_count));
 
-    const sprite_dc = (if (app.phase == .paused) sprite_pause else sprite_main) orelse return;
+    const sprite_dc = (if (app.phase == .paused)
+        sprite_pause
+    else if (app.mode == .timer and app.kind == .brk)
+        sprite_break
+    else
+        sprite_main) orelse return;
 
     // Fit HH:MM:SS into the client area, preserving glyph aspect ratio.
     var cell_h = height;
@@ -410,13 +593,16 @@ fn wndProc(hwnd: w32.HWND, msg: w32.UINT, wparam: w32.WPARAM, lparam: w32.LPARAM
             switch (wparam) {
                 timer_id_tick => {
                     if (app.mode == .timer and app.phase == .running and nowMs() >= app.end_ms) {
-                        finishTimer(hwnd);
+                        onCountdownDone(hwnd);
                     }
                     if (app.phase != .finished) updateTitle(hwnd);
                     _ = w32.InvalidateRect(hwnd, null, 0);
                 },
                 timer_id_track => {
-                    if (app.phase == .running) app.tracker.sample() catch {};
+                    // Only work time counts; breaks and pauses don't.
+                    if (app.phase == .running and app.kind == .work) {
+                        app.tracker.sample() catch {};
+                    }
                 },
                 else => {},
             }
@@ -428,6 +614,13 @@ fn wndProc(hwnd: w32.HWND, msg: w32.UINT, wparam: w32.WPARAM, lparam: w32.LPARAM
                     if (app.mode == .timer) {
                         togglePause();
                         app.last_title_sec = -1; // force title refresh
+                        _ = w32.InvalidateRect(hwnd, null, 0);
+                    }
+                },
+                w32.VK_F5 => {
+                    // Restart from cycle 1, like the original's re-parse.
+                    if (app.mode == .timer) {
+                        startWork(1);
                         _ = w32.InvalidateRect(hwnd, null, 0);
                     }
                 },
@@ -449,31 +642,36 @@ fn wndProc(hwnd: w32.HWND, msg: w32.UINT, wparam: w32.WPARAM, lparam: w32.LPARAM
 }
 
 pub fn main(init: std.process.Init) !void {
-    // Everything lives for the whole run; the process arena keeps
-    // cleanup trivial.
     const alloc = init.arena.allocator();
 
-    const cfg = parseArgs(try init.minimal.args.toSlice(alloc));
-    const total_ms: i64 = @intCast(cfg.seconds * 1000);
+    const cfg = parseArgs(alloc, try init.minimal.args.toSlice(alloc));
 
     app = .{
         .alloc = alloc,
         .mode = cfg.mode,
         .phase = .running,
-        .total_ms = total_ms,
-        .end_ms = nowMs() + total_ms,
-        .remaining_ms = total_ms,
+        .cycles_total = cfg.repeats,
+        .work_secs = cfg.seconds,
+        .break_secs = cfg.break_seconds,
+        .total_ms = 0,
+        .end_ms = 0,
+        .remaining_ms = 0,
         .tracker = Tracker.init(alloc),
         .chime_wav = try chime.buildWav(alloc),
+        .break_chime_wav = try chime.buildBreakWav(alloc),
         .message = cfg.message,
+        .allow = cfg.allow,
     };
 
     sprite_main = try makeSpriteDc(main_tint);
     sprite_pause = try makeSpriteDc(pause_tint);
+    sprite_break = try makeSpriteDc(break_tint);
 
-    // Focus tracking wants browser detail; the listener is harmless if
-    // the extension never connects.
-    if (cfg.mode == .timer) server.start();
+    if (cfg.mode == .timer) {
+        app.history = db.Db.open();
+        server.start();
+        startWork(1);
+    }
 
     const instance = w32.GetModuleHandleW(null);
     const class_name = L("sowon-zig");

@@ -1,24 +1,39 @@
 const std = @import("std");
 
 const sample_rate: u32 = 44100;
-const total_seconds: f64 = 2.4;
 const decay_tau: f64 = 0.45; // seconds; bigger = longer ring-out
 const attack: f64 = 0.008; // seconds; avoids a click at note onset
 const peak_amplitude: f64 = 0.7; // headroom after normalization
 
 const Note = struct { freq: f64, at: f64 };
 
-const notes = [_]Note{
+const finish_notes = [_]Note{
     .{ .freq = 523.25, .at = 0.00 }, // C5
     .{ .freq = 659.25, .at = 0.12 }, // E5
     .{ .freq = 783.99, .at = 0.24 }, // G5
     .{ .freq = 1046.50, .at = 0.36 }, // C6
 };
 
+// Shorter two-note "back to work" cue for break-end.
+const break_notes = [_]Note{
+    .{ .freq = 783.99, .at = 0.00 }, // G5
+    .{ .freq = 1046.50, .at = 0.10 }, // C6
+};
+
+/// Full end-of-work chime.
+pub fn buildWav(alloc: std.mem.Allocator) ![]u8 {
+    return build(alloc, &finish_notes, 2.4);
+}
+
+/// Short end-of-break chime.
+pub fn buildBreakWav(alloc: std.mem.Allocator) ![]u8 {
+    return build(alloc, &break_notes, 1.2);
+}
+
 /// Returns a complete WAV file image. The caller must keep it alive
 /// for as long as the sound may be playing (PlaySound with SND_ASYNC
 /// reads from the buffer while it plays).
-pub fn buildWav(alloc: std.mem.Allocator) ![]u8 {
+fn build(alloc: std.mem.Allocator, notes: []const Note, total_seconds: f64) ![]u8 {
     const n: usize = @intFromFloat(total_seconds * @as(f64, sample_rate));
 
     const mix = try alloc.alloc(f64, n);

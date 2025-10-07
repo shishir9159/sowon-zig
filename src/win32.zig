@@ -89,6 +89,7 @@ pub const SW_SHOW: c_int = 5;
 // Virtual keys
 pub const VK_ESCAPE: WPARAM = 0x1B;
 pub const VK_SPACE: WPARAM = 0x20;
+pub const VK_F5: WPARAM = 0x74;
 
 // GDI
 pub const SRCCOPY: DWORD = 0x00CC0020;
@@ -231,8 +232,13 @@ pub extern "msimg32" fn AlphaBlend(
 ) callconv(.winapi) BOOL;
 
 // kernel32
+pub const HMODULE = *opaque {};
 pub extern "kernel32" fn GetModuleHandleW(?[*:0]const u16) callconv(.winapi) ?HINSTANCE;
 pub extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+pub extern "kernel32" fn LoadLibraryW([*:0]const u16) callconv(.winapi) ?HMODULE;
+pub extern "kernel32" fn GetProcAddress(HMODULE, [*:0]const u8) callconv(.winapi) ?*anyopaque;
+pub extern "kernel32" fn GetEnvironmentVariableW([*:0]const u16, [*]u16, DWORD) callconv(.winapi) DWORD;
+pub extern "kernel32" fn CreateDirectoryW([*:0]const u16, ?*anyopaque) callconv(.winapi) BOOL;
 pub extern "kernel32" fn GetLocalTime(*SYSTEMTIME) callconv(.winapi) void;
 pub extern "kernel32" fn OpenProcess(DWORD, BOOL, DWORD) callconv(.winapi) ?HANDLE;
 pub extern "kernel32" fn CloseHandle(HANDLE) callconv(.winapi) BOOL;

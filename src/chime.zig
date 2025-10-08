@@ -30,6 +30,16 @@ pub fn buildBreakWav(alloc: std.mem.Allocator) ![]u8 {
     return build(alloc, &break_notes, 1.2);
 }
 
+// Single soft note used as the distraction nudge.
+const nudge_notes = [_]Note{
+    .{ .freq = 659.25, .at = 0.0 }, // E5
+};
+
+/// Quiet, short attention tick.
+pub fn buildNudgeWav(alloc: std.mem.Allocator) ![]u8 {
+    return build(alloc, &nudge_notes, 0.5);
+}
+
 /// Returns a complete WAV file image. The caller must keep it alive
 /// for as long as the sound may be playing (PlaySound with SND_ASYNC
 /// reads from the buffer while it plays).

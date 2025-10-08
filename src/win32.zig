@@ -83,13 +83,27 @@ pub const WM_TIMER: UINT = 0x0113;
 pub const CS_VREDRAW: UINT = 0x0001;
 pub const CS_HREDRAW: UINT = 0x0002;
 pub const WS_OVERLAPPEDWINDOW: DWORD = 0x00CF0000;
+pub const WS_EX_TOPMOST: DWORD = 0x0008;
 pub const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x80000000));
 pub const SW_SHOW: c_int = 5;
+pub const SW_HIDE: c_int = 0;
+pub const SW_RESTORE: c_int = 9;
+pub const SIZE_MINIMIZED: WPARAM = 1;
+pub const WM_APP: UINT = 0x8000;
+pub const WM_LBUTTONUP: LPARAM = 0x0202;
 
 // Virtual keys
 pub const VK_ESCAPE: WPARAM = 0x1B;
 pub const VK_SPACE: WPARAM = 0x20;
+pub const VK_PRIOR: WPARAM = 0x21; // Page Up
+pub const VK_NEXT: WPARAM = 0x22; // Page Down
+pub const VK_END: WPARAM = 0x23;
+pub const VK_HOME: WPARAM = 0x24;
+pub const VK_UP: WPARAM = 0x26;
+pub const VK_DOWN: WPARAM = 0x28;
 pub const VK_F5: WPARAM = 0x74;
+
+pub const WM_MOUSEWHEEL: UINT = 0x020A;
 
 // GDI
 pub const SRCCOPY: DWORD = 0x00CC0020;
@@ -246,6 +260,50 @@ pub extern "kernel32" fn QueryFullProcessImageNameW(HANDLE, DWORD, [*]u16, *DWOR
 
 // winmm
 pub extern "winmm" fn PlaySoundW(?*const anyopaque, ?HINSTANCE, DWORD) callconv(.winapi) BOOL;
+
+// Tray icon (Shell_NotifyIconW)
+pub const NOTIFYICONDATAW = extern struct {
+    cbSize: DWORD,
+    hWnd: ?HWND,
+    uID: UINT,
+    uFlags: UINT,
+    uCallbackMessage: UINT,
+    hIcon: ?HICON,
+    szTip: [128]u16,
+    dwState: DWORD,
+    dwStateMask: DWORD,
+    szInfo: [256]u16,
+    uTimeoutOrVersion: UINT,
+    szInfoTitle: [64]u16,
+    dwInfoFlags: DWORD,
+    guidItem: [16]u8,
+    hBalloonIcon: ?HICON,
+};
+
+pub const NIM_ADD: DWORD = 0;
+pub const NIM_MODIFY: DWORD = 1;
+pub const NIM_DELETE: DWORD = 2;
+pub const NIF_MESSAGE: UINT = 0x01;
+pub const NIF_ICON: UINT = 0x02;
+pub const NIF_TIP: UINT = 0x04;
+pub const NIF_INFO: UINT = 0x10;
+pub const NIIF_INFO: DWORD = 1;
+pub const IDI_APPLICATION: u16 = 32512;
+
+pub extern "shell32" fn Shell_NotifyIconW(DWORD, *NOTIFYICONDATAW) callconv(.winapi) BOOL;
+pub extern "user32" fn LoadIconW(?HINSTANCE, [*:0]const u16) callconv(.winapi) ?HICON;
+pub extern "user32" fn SetForegroundWindow(HWND) callconv(.winapi) BOOL;
+
+// Taskbar attention flash
+pub const FLASHWINFO = extern struct {
+    cbSize: UINT,
+    hwnd: ?HWND,
+    dwFlags: DWORD,
+    uCount: UINT,
+    dwTimeout: DWORD,
+};
+pub const FLASHW_ALL: DWORD = 3;
+pub extern "user32" fn FlashWindowEx(*const FLASHWINFO) callconv(.winapi) BOOL;
 
 // Slim reader/writer lock (used exclusively; a plain mutex)
 pub const SRWLOCK = usize;

@@ -1,0 +1,23 @@
+// FocusService: the bell-bearer Chrome extension reports the focused
+// tab to a running sowon timer.
+//
+// Transport is gRPC-Web (application/grpc-web+proto) because browsers
+// cannot speak native gRPC (no HTTP/2 trailers from fetch). Both ends
+// hand-encode/decode these messages; this file is the source of truth
+// for the wire format, not codegen input.
+
+syntax = "proto3";
+
+package bellbearer;
+
+service FocusService {
+  rpc ReportFocus(FocusUpdate) returns (Ack);
+}
+
+message FocusUpdate {
+  string tab_group = 1; // tab group title, empty if the tab is ungrouped
+  string tab_title = 2; // page title of the focused tab
+  string domain = 3; // hostname of the tab URL, "www." stripped
+}
+
+message Ack {}

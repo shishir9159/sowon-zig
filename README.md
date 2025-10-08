@@ -10,7 +10,7 @@ Requires Zig 0.15 nightly:
 ```POWERSHELL
 > cd sowon-zig
 > zig build -Doptimize=ReleaseSafe
-> .\zig-out\bin\sowon.exe 25m
+.\zig-out\bin\sowon.exe 25m -r 4 -b 5m -t deep-work -m "Stretch!" -a Chrome.exe -a Eat -a ziglang.org -n 40s --top
 ```
 
 ## Usage

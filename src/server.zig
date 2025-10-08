@@ -13,13 +13,15 @@ const std = @import("std");
 const w32 = @import("win32.zig");
 
 pub const port: u16 = 41414;
-pub const method_path = "/sowon.FocusService/ReportFocus";
+pub const method_path = "/bellbearer.FocusService/ReportFocus";
 
 var lock: w32.SRWLOCK = w32.SRWLOCK_INIT;
 var group_buf: [200]u8 = undefined;
 var group_len: usize = 0;
 var title_buf: [400]u8 = undefined;
 var title_len: usize = 0;
+var domain_buf: [200]u8 = undefined;
+var domain_len: usize = 0;
 var have_data: bool = false;
 
 /// Spawns the listener thread. Failure is non-fatal: sowon just won't
@@ -38,13 +40,17 @@ pub fn chromeContext(buf: []u8) ?[]const u8 {
     w32.AcquireSRWLockExclusive(&lock);
     defer w32.ReleaseSRWLockExclusive(&lock);
 
-    if (!have_data or title_len == 0) return null;
+    if (!have_data) return null;
     const group = group_buf[0..group_len];
-    const title = title_buf[0..title_len];
+    // Prefer the domain as the tracking key: it aggregates cleanly
+    // (one row per site), while titles change on every page.
+    const what = if (domain_len > 0) domain_buf[0..domain_len] else title_buf[0..title_len];
+    if (what.len == 0) return null;
+
     if (group.len > 0) {
-        return std.fmt.bufPrint(buf, "chrome [{s}] {s}", .{ group, title }) catch null;
+        return std.fmt.bufPrint(buf, "chrome [{s}] {s}", .{ group, what }) catch null;
     }
-    return std.fmt.bufPrint(buf, "chrome: {s}", .{title}) catch null;
+    return std.fmt.bufPrint(buf, "chrome: {s}", .{what}) catch null;
 }
 
 fn run() void {
@@ -136,6 +142,7 @@ fn handleRpc(request: Request) bool {
     defer w32.ReleaseSRWLockExclusive(&lock);
     group_len = copyValidUtf8(&group_buf, std.mem.trim(u8, update.tab_group, " \r\n"));
     title_len = copyValidUtf8(&title_buf, std.mem.trim(u8, update.tab_title, " \r\n"));
+    domain_len = copyValidUtf8(&domain_buf, std.mem.trim(u8, update.domain, " \r\n"));
     have_data = true;
     return true;
 }
@@ -143,6 +150,7 @@ fn handleRpc(request: Request) bool {
 const FocusUpdate = struct {
     tab_group: []const u8 = "",
     tab_title: []const u8 = "",
+    domain: []const u8 = "",
 };
 
 /// Minimal proto3 decoder for FocusUpdate (two length-delimited string
@@ -162,6 +170,7 @@ fn decodeFocusUpdate(msg: []const u8) ?FocusUpdate {
                 switch (field) {
                     1 => update.tab_group = bytes,
                     2 => update.tab_title = bytes,
+                    3 => update.domain = bytes,
                     else => {},
                 }
             },
@@ -231,11 +240,12 @@ fn copyValidUtf8(dst: []u8, src: []const u8) usize {
 }
 
 test decodeFocusUpdate {
-    // FocusUpdate { tab_group: "Research", tab_title: "Zig docs" }
-    const msg = "\x0a\x08Research\x12\x08Zig docs";
+    // FocusUpdate { tab_group: "Research", tab_title: "Zig docs", domain: "ziglang.org" }
+    const msg = "\x0a\x08Research\x12\x08Zig docs\x1a\x0bziglang.org";
     const update = decodeFocusUpdate(msg).?;
     try std.testing.expectEqualStrings("Research", update.tab_group);
     try std.testing.expectEqualStrings("Zig docs", update.tab_title);
+    try std.testing.expectEqualStrings("ziglang.org", update.domain);
 
     // Empty group, unknown extra varint field (3 << 3 | 0), title only.
     const msg2 = "\x18\x2a\x12\x05Hello";

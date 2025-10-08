@@ -14,23 +14,32 @@ pub const Tracker = struct {
         return .{ .map = std.StringHashMap(u64).init(alloc) };
     }
 
-    pub fn sample(self: *Tracker) !void {
+    /// Credits `seconds` to the current foreground app and returns the
+    /// (map-owned, stable) usage key it was counted under.
+    pub fn sample(self: *Tracker, seconds: u64) ![]const u8 {
         var buf: [512]u8 = undefined;
         var chrome_buf: [700]u8 = undefined;
         var name = foregroundAppName(&buf);
 
         // With the bell-bearer extension connected, split Chrome time
-        // by tab group and page title instead of lumping it together.
+        // by tab group and site instead of lumping it together.
         if (std.ascii.eqlIgnoreCase(name, "chrome.exe")) {
             if (server.chromeContext(&chrome_buf)) |ctx| name = ctx;
         }
 
+        return self.add(name, seconds);
+    }
+
+    /// Credits `seconds` to `name` directly (also used to fold one
+    /// session's totals into the whole-run aggregate).
+    pub fn add(self: *Tracker, name: []const u8, seconds: u64) ![]const u8 {
         const gop = try self.map.getOrPut(name);
         if (!gop.found_existing) {
             gop.key_ptr.* = try self.map.allocator.dupe(u8, name);
             gop.value_ptr.* = 0;
         }
-        gop.value_ptr.* += 1;
+        gop.value_ptr.* += seconds;
+        return gop.key_ptr.*;
     }
 
     pub fn sortedEntries(self: *const Tracker, alloc: std.mem.Allocator) ![]Entry {

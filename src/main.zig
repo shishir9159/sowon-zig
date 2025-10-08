@@ -5,17 +5,21 @@ const chime = @import("chime.zig");
 const digits = @import("digits.zig");
 const server = @import("server.zig");
 const db = @import("db.zig");
+const frame = @import("render/frame.zig");
 const Tracker = @import("tracker.zig").Tracker;
+
+// Build-time backend selection (-Drenderer=...): only the chosen
+// module is analyzed and compiled; the others are discarded.
+const renderer = switch (build_options.renderer) {
+    .gdi => @import("render/gdi.zig"),
+    .opengl => @import("render/opengl.zig"),
+    .vulkan => @import("render/vulkan.zig"),
+    .sdl => @import("render/sdl.zig"),
+    .glfw => @import("render/glfw.zig"),
+};
 
 const L = std.unicode.utf8ToUtf16LeStringLiteral;
 
-const bg_color = w32.rgb(24, 24, 24);
-const main_color = w32.rgb(220, 220, 220);
-const main_tint = [3]u8{ 220, 220, 220 };
-const pause_tint = [3]u8{ 220, 120, 120 };
-const break_tint = [3]u8{ 130, 210, 150 };
-
-const chars_count = 8; // HH:MM:SS
 const max_display_secs = 99 * 3600 + 59 * 60 + 59;
 const wiggle_period_ms = 133; // = 0.40s / WIGGLE_COUNT, like the original
 
@@ -574,94 +578,44 @@ fn updateTitle(hwnd: w32.HWND) void {
 }
 
 // --- Rendering --------------------------------------------------------
+// main.zig only decides WHAT to show; the backend selected at build
+// time (-Drenderer=...) decides HOW to draw it.
 
-// One memory DC per tint, each holding the sprite sheet as a
-// premultiplied-alpha DIB. Created once in main, live for the process.
-var sprite_main: ?w32.HDC = null;
-var sprite_pause: ?w32.HDC = null;
-var sprite_break: ?w32.HDC = null;
+/// Describes the current frame for the renderer.
+fn currentView() frame.View {
+    if (app.phase == .finished) {
+        return .{ .report = .{
+            .lines = app.report_lines,
+            .scroll = &app.report_scroll,
+        } };
+    }
 
-fn makeSpriteDc(tint: [3]u8) !w32.HDC {
-    var bi = std.mem.zeroes(w32.BITMAPINFO);
-    bi.bmiHeader.biSize = @sizeOf(w32.BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = digits.sheet_width;
-    bi.bmiHeader.biHeight = -@as(i32, digits.sheet_height); // top-down
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = w32.BI_RGB;
-
-    var bits: ?*anyopaque = null;
-    const bmp = w32.CreateDIBSection(null, &bi, w32.DIB_RGB_COLORS, &bits, null, 0) orelse
-        return error.CreateDIBSectionFailed;
-    const pixels: [*]u8 = @ptrCast(bits orelse return error.CreateDIBSectionFailed);
-    digits.writeTintedPremultiplied(pixels[0..digits.byte_len], tint);
-
-    const dc = w32.CreateCompatibleDC(null) orelse return error.CreateDCFailed;
-    _ = w32.SelectObject(dc, bmp);
-    return dc;
-}
-
-fn drawClockFace(hdc: w32.HDC, width: i32, height: i32) void {
     const hms = displayedHms();
-    const columns = [chars_count]u8{
-        @intCast(hms[0] / 10), @intCast(hms[0] % 10), digits.colon_column,
-        @intCast(hms[1] / 10), @intCast(hms[1] % 10), digits.colon_column,
-        @intCast(hms[2] / 10), @intCast(hms[2] % 10),
-    };
     // Same per-position wiggle phases as the original renderer.
-    const wiggle_offsets = [chars_count]u8{ 0, 1, 0, 2, 3, 1, 4, 5 };
+    const wiggle_offsets = [frame.chars_count]u8{ 0, 1, 0, 2, 3, 1, 4, 5 };
     const wiggle_index: u32 = @intCast(@mod(@divTrunc(nowMs(), wiggle_period_ms), digits.wiggle_count));
 
-    const sprite_dc = (if (app.phase == .paused)
-        sprite_pause
+    var rows: [frame.chars_count]u8 = undefined;
+    for (wiggle_offsets, 0..) |offset, i| {
+        rows[i] = @intCast((wiggle_index + offset) % digits.wiggle_count);
+    }
+
+    const tint: frame.Tint = if (app.phase == .paused)
+        .paused
     else if (app.mode == .timer and app.kind == .brk)
-        sprite_break
+        .brk
     else
-        sprite_main) orelse return;
+        .normal;
 
-    // Fit HH:MM:SS into the client area, preserving glyph aspect ratio.
-    var cell_h = height;
-    var cell_w = @divTrunc(cell_h * digits.char_width, digits.char_height);
-    if (cell_w * chars_count > width) {
-        cell_w = @divTrunc(width, chars_count);
-        cell_h = @divTrunc(cell_w * digits.char_height, digits.char_width);
-    }
-    const pen_x = @divTrunc(width - cell_w * chars_count, 2);
-    const pen_y = @divTrunc(height - cell_h, 2);
-
-    const blend = w32.BLENDFUNCTION{
-        .BlendOp = w32.AC_SRC_OVER,
-        .BlendFlags = 0,
-        .SourceConstantAlpha = 255,
-        .AlphaFormat = w32.AC_SRC_ALPHA,
-    };
-
-    for (columns, wiggle_offsets, 0..) |col, wiggle_offset, i| {
-        const row = (wiggle_index + wiggle_offset) % digits.wiggle_count;
-        _ = w32.AlphaBlend(
-            hdc,
-            pen_x + @as(i32, @intCast(i)) * cell_w,
-            pen_y,
-            cell_w,
-            cell_h,
-            sprite_dc,
-            @as(i32, col) * digits.char_width,
-            @as(i32, @intCast(row)) * digits.char_height,
-            digits.char_width,
-            digits.char_height,
-            blend,
-        );
-    }
-}
-
-const report_top_margin: i32 = 24;
-
-fn reportLineHeight(height: i32) i32 {
-    return std.math.clamp(@divTrunc(height, 18), 18, 44);
-}
-
-fn reportVisibleLines(height: i32) i32 {
-    return @max(@divTrunc(height - report_top_margin, reportLineHeight(height)), 1);
+    return .{ .clock = .{
+        .columns = .{
+            @intCast(hms[0] / 10), @intCast(hms[0] % 10), digits.colon_column,
+            @intCast(hms[1] / 10), @intCast(hms[1] % 10), digits.colon_column,
+            @intCast(hms[2] / 10), @intCast(hms[2] % 10),
+        },
+        .rows = rows,
+        .tint = tint,
+    } };
 }
 
 /// Clamps and applies a scroll request against the current window size.
@@ -670,7 +624,7 @@ fn scrollReport(hwnd: w32.HWND, delta_lines: i32) void {
 
     var rc: w32.RECT = undefined;
     _ = w32.GetClientRect(hwnd, &rc);
-    const visible = reportVisibleLines(rc.bottom - rc.top);
+    const visible = renderer.reportVisibleLines(rc.bottom - rc.top);
     const total: i32 = @intCast(app.report_lines.len);
     const max_scroll = @max(total - visible, 0);
 
@@ -678,99 +632,12 @@ fn scrollReport(hwnd: w32.HWND, delta_lines: i32) void {
     _ = w32.InvalidateRect(hwnd, null, 0);
 }
 
-fn drawReport(hdc: w32.HDC, height: i32) void {
-    const line_height = reportLineHeight(height);
-    const font = w32.CreateFontW(
-        -(line_height - 6),
-        0,
-        0,
-        0,
-        w32.FW_NORMAL,
-        0,
-        0,
-        0,
-        w32.DEFAULT_CHARSET,
-        0,
-        0,
-        w32.CLEARTYPE_QUALITY,
-        0,
-        L("Consolas"),
-    ) orelse return;
-    defer _ = w32.DeleteObject(font);
-
-    const old_font = w32.SelectObject(hdc, font);
-    defer if (old_font) |f| {
-        _ = w32.SelectObject(hdc, f);
-    };
-
-    _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
-    _ = w32.SetTextColor(hdc, main_color);
-
-    // Keep the scroll position valid for the current window size.
-    const total: i32 = @intCast(app.report_lines.len);
-    const max_scroll = @max(total - reportVisibleLines(height), 0);
-    app.report_scroll = std.math.clamp(app.report_scroll, 0, max_scroll);
-
-    var y: i32 = report_top_margin;
-    const start: usize = @intCast(app.report_scroll);
-    for (app.report_lines[start..]) |line| {
-        if (y >= height) break;
-        _ = w32.TextOutW(hdc, 24, y, line.ptr, @intCast(line.len));
-        y += line_height;
-    }
-
-    // Overflow hints so it's obvious there is more to scroll to.
-    if (app.report_scroll > 0) {
-        const up = L("^^^");
-        _ = w32.TextOutW(hdc, 4, report_top_margin, up.ptr, @intCast(up.len));
-    }
-    if (app.report_scroll < max_scroll) {
-        const down = L("vvv");
-        _ = w32.TextOutW(hdc, 4, height - line_height, down.ptr, @intCast(down.len));
-    }
-}
-
-fn onPaint(hwnd: w32.HWND) void {
-    var ps: w32.PAINTSTRUCT = undefined;
-    const hdc = w32.BeginPaint(hwnd, &ps) orelse return;
-    defer _ = w32.EndPaint(hwnd, &ps);
-
-    var rc: w32.RECT = undefined;
-    _ = w32.GetClientRect(hwnd, &rc);
-    const width = rc.right - rc.left;
-    const height = rc.bottom - rc.top;
-    if (width <= 0 or height <= 0) return;
-
-    // Double buffering: draw into a memory bitmap, blit once.
-    const mem_dc = w32.CreateCompatibleDC(hdc) orelse return;
-    defer _ = w32.DeleteDC(mem_dc);
-    const bitmap = w32.CreateCompatibleBitmap(hdc, width, height) orelse return;
-    defer _ = w32.DeleteObject(bitmap);
-    const old_bitmap = w32.SelectObject(mem_dc, bitmap);
-    defer if (old_bitmap) |b| {
-        _ = w32.SelectObject(mem_dc, b);
-    };
-
-    if (w32.CreateSolidBrush(bg_color)) |bg_brush| {
-        _ = w32.FillRect(mem_dc, &rc, bg_brush);
-        _ = w32.DeleteObject(bg_brush);
-    }
-
-    if (app.phase == .finished) {
-        drawReport(mem_dc, height);
-    } else {
-        drawClockFace(mem_dc, width, height);
-    }
-
-    _ = w32.BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, w32.SRCCOPY);
-}
-
 // --- Window proc & main -----------------------------------------------
 
 fn wndProc(hwnd: w32.HWND, msg: w32.UINT, wparam: w32.WPARAM, lparam: w32.LPARAM) callconv(.winapi) w32.LRESULT {
     switch (msg) {
         w32.WM_PAINT => {
-            onPaint(hwnd);
+            renderer.paint(hwnd, currentView());
             return 0;
         },
         w32.WM_ERASEBKGND => return 1, // memory bitmap covers everything
@@ -924,9 +791,7 @@ pub fn main(init: std.process.Init) !void {
         .nudge_threshold = cfg.nudge_seconds,
     };
 
-    sprite_main = try makeSpriteDc(main_tint);
-    sprite_pause = try makeSpriteDc(pause_tint);
-    sprite_break = try makeSpriteDc(break_tint);
+    try renderer.init();
 
     if (cfg.mode == .timer) {
         app.history = db.Db.open();

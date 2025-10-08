@@ -1,3 +1,0 @@
-
-=== sowon: tagged run (session: 3s) ===
-         2s   sowon.exe

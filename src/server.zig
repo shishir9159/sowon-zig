@@ -1,11 +1,11 @@
 //! gRPC-Web listener for the bell-bearer Chrome extension.
 //!
-//! Implements the unary call sowon.FocusService/ReportFocus defined in
-//! proto/sowon.proto over gRPC-Web (application/grpc-web+proto), since
-//! browsers cannot speak native gRPC. The extension POSTs a framed
-//! protobuf FocusUpdate { tab_group = 1, tab_title = 2 } on every focus
-//! change; the latest snapshot is kept behind a lock and read by the
-//! tracker when chrome.exe owns the foreground window.
+//! Implements the unary call bellbearer.FocusService/ReportFocus defined
+//! in proto/bell-bearer.proto over gRPC-Web (application/grpc-web+proto),
+//! since browsers cannot speak native gRPC. The extension POSTs a framed
+//! protobuf FocusUpdate { tab_group = 1, tab_title = 2, domain = 3 } on
+//! every focus change; the latest snapshot is kept behind a lock and
+//! read by the tracker when chrome.exe owns the foreground window.
 //!
 //! Purely optional: if nothing ever connects, sowon behaves as before.
 
@@ -72,6 +72,13 @@ fn run() void {
     while (true) {
         const conn = w32.accept(sock, null, null);
         if (conn == w32.INVALID_SOCKET) continue;
+
+        // Cap how long a single client can hold the (single-threaded)
+        // accept loop: a peer that connects but never finishes its
+        // request must not wedge the listener for the whole session.
+        const timeout_ms: w32.DWORD = 3000;
+        _ = w32.setsockopt(conn, w32.SOL_SOCKET, w32.SO_RCVTIMEO, std.mem.asBytes(&timeout_ms), @sizeOf(w32.DWORD));
+
         handle(conn);
         _ = w32.closesocket(conn);
     }
@@ -83,6 +90,8 @@ fn handle(conn: w32.SOCKET) void {
     var ok = false;
 
     while (len < req.len) {
+        // recv returns <= 0 on close, error, or the timeout above; any
+        // of those ends this connection cleanly.
         const n = w32.recv(conn, req[len..].ptr, @intCast(req.len - len), 0);
         if (n <= 0) break;
         len += @intCast(n);

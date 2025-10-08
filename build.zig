@@ -79,4 +79,18 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run sowon");
     run_step.dependOn(&run_cmd.step);
+
+    // `zig build test`: unit tests for the pure helpers and the
+    // protobuf decoder. These modules have no OS/global-state deps.
+    const test_step = b.step("test", "Run unit tests");
+    for ([_][]const u8{ "src/util.zig", "src/server.zig" }) |src| {
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
 }

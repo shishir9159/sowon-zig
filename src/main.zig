@@ -5,8 +5,18 @@ const chime = @import("chime.zig");
 const digits = @import("digits.zig");
 const server = @import("server.zig");
 const db = @import("db.zig");
+const util = @import("util.zig");
 const frame = @import("render/frame.zig");
 const Tracker = @import("tracker.zig").Tracker;
+
+const parseDuration = util.parseDuration;
+const fmtDur = util.fmtDur;
+
+// Usage credited to this bucket when input has been idle for a while;
+// excluded from the focus/distraction split so a bio break neither
+// flatters nor punishes the score.
+const idle_key = "(idle)";
+const idle_threshold_secs: u64 = 120;
 
 // Build-time backend selection (-Drenderer=...): only the chosen
 // module is analyzed and compiled; the others are discarded.
@@ -67,6 +77,7 @@ const App = struct {
     history: ?db.Db = null,
     session_start_buf: [32]u8 = undefined,
     session_start_len: usize = 0,
+    session_start_ms: i64 = 0, // monotonic; for actual elapsed wall-clock
     report_lines: []const [:0]const u16 = &.{},
     report_scroll: i32 = 0, // first visible report line
     last_title_sec: i64 = -1,
@@ -101,32 +112,6 @@ const Config = struct {
     allow: []const []const u8 = &.{},
 };
 
-fn parseDuration(s: []const u8) !u64 {
-    var total: f64 = 0;
-    var i: usize = 0;
-    while (i < s.len) {
-        var j = i;
-        while (j < s.len and (std.ascii.isDigit(s[j]) or s[j] == '.')) j += 1;
-        if (j == i) return error.InvalidDuration;
-        const x = try std.fmt.parseFloat(f64, s[i..j]);
-
-        var mult: f64 = 1;
-        if (j < s.len) {
-            mult = switch (s[j]) {
-                's' => 1,
-                'm' => 60,
-                'h' => 3600,
-                else => return error.InvalidDuration,
-            };
-            j += 1;
-        }
-        total += x * mult;
-        i = j;
-    }
-    if (total < 1) return error.InvalidDuration;
-    return @intFromFloat(total);
-}
-
 fn usageAndExit() noreturn {
     std.debug.print(
         \\usage:
@@ -138,14 +123,18 @@ fn usageAndExit() noreturn {
         \\    -r 4                       repeat: 4 work sessions (pomodoro)
         \\    -b 5m                      break between work sessions
         \\    -a explorer.exe            allow an app, Chrome tab group, or
-        \\                               domain in focus mode; repeatable
+        \\                               domain in focus mode; repeatable.
+        \\                               Adds to the saved allow list.
         \\    -n 30s                     nudge (flash + tick) after being
-        \\                               distracted this long; needs -a
+        \\                               distracted this long; needs allows
         \\    --top                      keep the window always on top
         \\
         \\  sowon history [N]            show the last N sessions (default 15)
         \\  sowon report today|week      aggregate report
         \\    -t deep-work               ... only sessions with this tag
+        \\  sowon allow list             show the saved allow list
+        \\  sowon allow add <pattern>    add an app/group/domain to it
+        \\  sowon allow remove <pattern> remove one
         \\
         \\Sessions are recorded to %LOCALAPPDATA%\sowon\sowon.db.
         \\
@@ -203,28 +192,8 @@ fn parseArgs(alloc: std.mem.Allocator, args: []const [:0]const u8) Config {
 
 // --- Focus classification ----------------------------------------------
 
-/// True if this usage entry matches the allow list: the app name itself
-/// ("explorer.exe"), or for Chrome entries from the extension, the tab
-/// group name or the site domain ("chrome [Research] ziglang.org").
 fn isAllowed(name: []const u8) bool {
-    const group_prefix = "chrome [";
-    const plain_prefix = "chrome: ";
-
-    for (app.allow) |pattern| {
-        if (std.ascii.eqlIgnoreCase(name, pattern)) return true;
-
-        if (std.mem.startsWith(u8, name, group_prefix)) {
-            const rest = name[group_prefix.len..];
-            if (std.mem.indexOfScalar(u8, rest, ']')) |end| {
-                if (std.ascii.eqlIgnoreCase(rest[0..end], pattern)) return true;
-                // "] " is followed by the domain (or title fallback).
-                if (end + 2 <= rest.len and std.ascii.eqlIgnoreCase(rest[end + 2 ..], pattern)) return true;
-            }
-        } else if (std.mem.startsWith(u8, name, plain_prefix)) {
-            if (std.ascii.eqlIgnoreCase(name[plain_prefix.len..], pattern)) return true;
-        }
-    }
-    return false;
+    return util.isAllowedIn(app.allow, name);
 }
 
 const FocusSplit = struct { focused: u64, distracted: u64 };
@@ -232,6 +201,7 @@ const FocusSplit = struct { focused: u64, distracted: u64 };
 fn splitFocus(entries: []const Tracker.Entry) FocusSplit {
     var split = FocusSplit{ .focused = 0, .distracted = 0 };
     for (entries) |e| {
+        if (std.mem.eql(u8, e.name, idle_key)) continue; // idle is neither
         if (isAllowed(e.name)) {
             split.focused += e.seconds;
         } else {
@@ -239,6 +209,15 @@ fn splitFocus(entries: []const Tracker.Entry) FocusSplit {
         }
     }
     return split;
+}
+
+/// Seconds since the last keyboard/mouse input, system-wide.
+fn idleSeconds() u64 {
+    var info = w32.LASTINPUTINFO{ .cbSize = @sizeOf(w32.LASTINPUTINFO), .dwTime = 0 };
+    if (w32.GetLastInputInfo(&info) == 0) return 0;
+    // 32-bit GetTickCount stamp; wrapping subtraction handles rollover.
+    const now32: u32 = @truncate(@as(u64, @bitCast(nowMs())));
+    return (now32 -% info.dwTime) / 1000;
 }
 
 // --- Time & state -----------------------------------------------------
@@ -297,6 +276,7 @@ fn startWork(cycle: u32) void {
     app.tracker = Tracker.init(app.alloc); // fresh stats per work session
     app.report_lines = &.{};
     app.session_start_len = nowLocalString(&app.session_start_buf).len;
+    app.session_start_ms = nowMs();
     startCountdown(app.work_secs);
 }
 
@@ -387,16 +367,21 @@ fn endWorkSession() void {
         for (entries, 0..) |e, i| {
             rows[i] = .{ .app = e.name, .seconds = e.seconds, .allowed = isAllowed(e.name) };
         }
-        history.recordSession(
-            app.session_start_buf[0..app.session_start_len],
-            app.work_secs,
-            app.message,
-            app.tag,
-            app.cycle,
-            split.focused,
-            split.distracted,
-            rows,
-        );
+        // Actual wall-clock span, including any paused time — this is
+        // what makes started_at + elapsed line up, unlike the planned
+        // (active) duration.
+        const elapsed: u64 = @intCast(@divTrunc(@max(nowMs() - app.session_start_ms, 0) + 500, 1000));
+        history.recordSession(.{
+            .started_at = app.session_start_buf[0..app.session_start_len],
+            .duration_sec = app.work_secs,
+            .elapsed_sec = elapsed,
+            .message = app.message,
+            .tag = app.tag,
+            .cycle = app.cycle,
+            .focused_sec = split.focused,
+            .distracted_sec = split.distracted,
+            .rows = rows,
+        });
     }
 }
 
@@ -422,15 +407,6 @@ fn onCountdownDone(hwnd: w32.HWND) void {
         },
     }
     _ = w32.InvalidateRect(hwnd, null, 0);
-}
-
-fn fmtDur(buf: []u8, secs: u64) ![]const u8 {
-    const h = secs / 3600;
-    const m = secs / 60 % 60;
-    const s = secs % 60;
-    if (h > 0) return std.fmt.bufPrint(buf, "{d}h {d:0>2}m {d:0>2}s", .{ h, m, s });
-    if (m > 0) return std.fmt.bufPrint(buf, "{d}m {d:0>2}s", .{ m, s });
-    return std.fmt.bufPrint(buf, "{d}s", .{s});
 }
 
 fn putLine(lines: [][:0]const u16, idx: *usize, text: []const u8) !void {
@@ -532,6 +508,11 @@ fn finishAll(hwnd: w32.HWND) void {
     buildReport() catch |err| {
         std.debug.print("failed to build usage report: {}\n", .{err});
     };
+
+    // Bring the report to the user even if the window was minimized to
+    // the tray while the timer ran.
+    _ = w32.ShowWindow(hwnd, w32.SW_RESTORE);
+    _ = w32.SetForegroundWindow(hwnd);
 
     // Show the custom message in the title bar, truncated if needed.
     var tbuf: [128]u8 = undefined;
@@ -653,17 +634,25 @@ fn wndProc(hwnd: w32.HWND, msg: w32.UINT, wparam: w32.WPARAM, lparam: w32.LPARAM
                 timer_id_track => {
                     // Only work time counts; breaks and pauses don't.
                     if (app.phase == .running and app.kind == .work) {
-                        const name: ?[]const u8 = app.tracker.sample(sample_interval_secs) catch null;
-                        if (app.nudge_threshold > 0 and app.allow.len > 0) {
-                            if (name != null and !isAllowed(name.?)) {
-                                app.nudge_run += sample_interval_secs;
-                                if (app.nudge_run >= app.nudge_threshold) {
-                                    app.nudge_run = 0; // re-nudge after another run
-                                    nudge(hwnd);
-                                }
-                            } else {
-                                app.nudge_run = 0;
+                        // Away from the keyboard/mouse? Credit idle time
+                        // instead of whatever window happens to be focused.
+                        const idle = idleSeconds() >= idle_threshold_secs;
+                        const name: ?[]const u8 = if (idle)
+                            (app.tracker.add(idle_key, sample_interval_secs) catch null)
+                        else
+                            (app.tracker.sample(sample_interval_secs) catch null);
+
+                        // Nudge only for real, non-idle distraction.
+                        if (!idle and app.nudge_threshold > 0 and app.allow.len > 0 and
+                            name != null and !isAllowed(name.?))
+                        {
+                            app.nudge_run += sample_interval_secs;
+                            if (app.nudge_run >= app.nudge_threshold) {
+                                app.nudge_run = 0; // re-nudge after another run
+                                nudge(hwnd);
                             }
+                        } else {
+                            app.nudge_run = 0;
                         }
                     }
                 },
@@ -730,16 +719,24 @@ fn wndProc(hwnd: w32.HWND, msg: w32.UINT, wparam: w32.WPARAM, lparam: w32.LPARAM
     }
 }
 
+/// Writes report/history output to real stdout (so it can be piped or
+/// redirected), not stderr.
+fn writeStdout(io: std.Io, bytes: []const u8) void {
+    std.Io.File.stdout().writeStreamingAll(io, bytes) catch {};
+}
+
 /// `sowon history [N]` — print recent sessions and exit.
-fn runHistory(args: []const [:0]const u8) void {
+fn runHistory(alloc: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) void {
     var limit: u32 = 15;
     if (args.len >= 3) limit = std.fmt.parseInt(u32, args[2], 10) catch usageAndExit();
     var d = db.Db.open() orelse return;
-    d.printHistory(limit);
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    d.printHistory(&aw.writer, limit);
+    writeStdout(io, aw.written());
 }
 
 /// `sowon report today|week [-t tag]` — print aggregates and exit.
-fn runReport(args: []const [:0]const u8) void {
+fn runReport(alloc: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) void {
     var range: db.Db.Range = .today;
     var tag: []const u8 = "";
     var i: usize = 2;
@@ -757,15 +754,41 @@ fn runReport(args: []const [:0]const u8) void {
         }
     }
     var d = db.Db.open() orelse return;
-    d.printReport(range, tag);
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    d.printReport(&aw.writer, range, tag);
+    writeStdout(io, aw.written());
+}
+
+/// `sowon allow list|add|remove [pattern]` — manage the saved allow list.
+fn runAllow(alloc: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) void {
+    if (args.len < 3) usageAndExit();
+    var d = db.Db.open() orelse return;
+    const sub = args[2];
+    if (std.mem.eql(u8, sub, "list")) {
+        var aw = std.Io.Writer.Allocating.init(alloc);
+        d.printAllow(&aw.writer);
+        writeStdout(io, aw.written());
+    } else if (std.mem.eql(u8, sub, "add")) {
+        if (args.len < 4) usageAndExit();
+        d.allowAdd(args[3]);
+        writeStdout(io, "added\n");
+    } else if (std.mem.eql(u8, sub, "remove")) {
+        if (args.len < 4) usageAndExit();
+        d.allowRemove(args[3]);
+        writeStdout(io, "removed\n");
+    } else {
+        usageAndExit();
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
     const alloc = init.arena.allocator();
+    const io = init.io;
     const args = try init.minimal.args.toSlice(alloc);
 
-    if (args.len >= 2 and std.mem.eql(u8, args[1], "history")) return runHistory(args);
-    if (args.len >= 2 and std.mem.eql(u8, args[1], "report")) return runReport(args);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "history")) return runHistory(alloc, io, args);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "report")) return runReport(alloc, io, args);
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "allow")) return runAllow(alloc, io, args);
 
     const cfg = parseArgs(alloc, args);
 
@@ -795,6 +818,12 @@ pub fn main(init: std.process.Init) !void {
 
     if (cfg.mode == .timer) {
         app.history = db.Db.open();
+        if (app.history) |*h| {
+            // CLI -a patterns are saved, then the effective allow list
+            // is the full persisted set (CLI + previously saved).
+            for (cfg.allow) |p| h.allowAdd(p);
+            app.allow = h.loadAllow(alloc);
+        }
         server.start();
         startWork(1);
     }

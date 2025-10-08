@@ -294,6 +294,14 @@ pub extern "shell32" fn Shell_NotifyIconW(DWORD, *NOTIFYICONDATAW) callconv(.win
 pub extern "user32" fn LoadIconW(?HINSTANCE, [*:0]const u16) callconv(.winapi) ?HICON;
 pub extern "user32" fn SetForegroundWindow(HWND) callconv(.winapi) BOOL;
 
+// Idle detection: dwTime is a 32-bit GetTickCount() stamp of the last
+// keyboard/mouse input; idle_ms = GetTickCount() - dwTime.
+pub const LASTINPUTINFO = extern struct {
+    cbSize: UINT,
+    dwTime: DWORD,
+};
+pub extern "user32" fn GetLastInputInfo(*LASTINPUTINFO) callconv(.winapi) BOOL;
+
 // Taskbar attention flash
 pub const FLASHWINFO = extern struct {
     cbSize: UINT,
@@ -325,6 +333,10 @@ pub const sockaddr_in = extern struct {
     sin_zero: [8]u8,
 };
 
+// setsockopt: SO_RCVTIMEO takes a DWORD timeout in milliseconds.
+pub const SOL_SOCKET: c_int = 0xffff;
+pub const SO_RCVTIMEO: c_int = 0x1006;
+
 pub extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *anyopaque) callconv(.winapi) c_int;
 pub extern "ws2_32" fn socket(af: c_int, sock_type: c_int, protocol: c_int) callconv(.winapi) SOCKET;
 pub extern "ws2_32" fn bind(s: SOCKET, name: *const sockaddr_in, namelen: c_int) callconv(.winapi) c_int;
@@ -333,6 +345,7 @@ pub extern "ws2_32" fn accept(s: SOCKET, addr: ?*anyopaque, addrlen: ?*c_int) ca
 pub extern "ws2_32" fn recv(s: SOCKET, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
 pub extern "ws2_32" fn send(s: SOCKET, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
 pub extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) c_int;
+pub extern "ws2_32" fn setsockopt(s: SOCKET, level: c_int, optname: c_int, optval: [*]const u8, optlen: c_int) callconv(.winapi) c_int;
 
 pub fn rgb(r: u8, g: u8, b: u8) COLORREF {
     return @as(COLORREF, r) | (@as(COLORREF, g) << 8) | (@as(COLORREF, b) << 16);

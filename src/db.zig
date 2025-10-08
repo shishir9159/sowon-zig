@@ -5,14 +5,21 @@
 //!
 //! Database: %LOCALAPPDATA%\sowon\sowon.db
 //!
-//!   sessions(id, started_at, duration_sec, message, kind, cycle,
-//!            focused_sec, distracted_sec)
+//!   sessions(id, started_at, duration_sec, elapsed_sec, message,
+//!            cycle, focused_sec, distracted_sec, tag)
 //!   app_usage(session_id, app, seconds, allowed)
+//!   allow_list(pattern)
+//!
+//! Report/history output is written to a caller-supplied std.Io.Writer
+//! (so `sowon history`/`report` go to stdout); only diagnostics go to
+//! stderr via std.debug.print.
 
 const std = @import("std");
 const w32 = @import("win32.zig");
+const util = @import("util.zig");
 
 const L = std.unicode.utf8ToUtf16LeStringLiteral;
+const Writer = std.Io.Writer;
 
 const Sqlite3 = opaque {};
 const Stmt = opaque {};
@@ -41,6 +48,18 @@ pub const UsageRow = struct {
     app: []const u8,
     seconds: u64,
     allowed: bool,
+};
+
+pub const Session = struct {
+    started_at: []const u8,
+    duration_sec: u64,
+    elapsed_sec: u64,
+    message: []const u8,
+    tag: []const u8,
+    cycle: u32,
+    focused_sec: u64,
+    distracted_sec: u64,
+    rows: []const UsageRow,
 };
 
 pub const Db = struct {
@@ -81,8 +100,8 @@ pub const Db = struct {
             \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
             \\  started_at TEXT NOT NULL,
             \\  duration_sec INTEGER NOT NULL,
+            \\  elapsed_sec INTEGER NOT NULL DEFAULT 0,
             \\  message TEXT NOT NULL,
-            \\  kind TEXT NOT NULL,
             \\  cycle INTEGER NOT NULL,
             \\  focused_sec INTEGER NOT NULL,
             \\  distracted_sec INTEGER NOT NULL,
@@ -94,43 +113,40 @@ pub const Db = struct {
             \\  seconds INTEGER NOT NULL,
             \\  allowed INTEGER NOT NULL
             \\);
+            \\CREATE TABLE IF NOT EXISTS allow_list (
+            \\  pattern TEXT PRIMARY KEY
+            \\);
         );
-        // Migration for databases created before the tag column existed;
-        // fails harmlessly ("duplicate column") on up-to-date files.
+        // Migrations for databases created by older builds. Each fails
+        // harmlessly (duplicate column / no such column) when already
+        // in the target shape.
         db.execSilent("ALTER TABLE sessions ADD COLUMN tag TEXT NOT NULL DEFAULT ''");
+        db.execSilent("ALTER TABLE sessions ADD COLUMN elapsed_sec INTEGER NOT NULL DEFAULT 0");
+        db.execSilent("ALTER TABLE sessions DROP COLUMN kind"); // always 'work'; dropped
         return db;
     }
 
     /// Records one finished work session with its per-app breakdown.
     /// Failures are logged and swallowed: history must never take the
     /// timer down.
-    pub fn recordSession(
-        self: *Db,
-        started_at: []const u8,
-        duration_sec: u64,
-        message: []const u8,
-        tag: []const u8,
-        cycle: u32,
-        focused_sec: u64,
-        distracted_sec: u64,
-        rows: []const UsageRow,
-    ) void {
+    pub fn recordSession(self: *Db, s: Session) void {
         self.execSimple("BEGIN");
 
         var stmt = self.prepare(
-            "INSERT INTO sessions (started_at, duration_sec, message, kind, cycle, focused_sec, distracted_sec, tag)" ++
-                " VALUES (?1, ?2, ?3, 'work', ?4, ?5, ?6, ?7)",
+            "INSERT INTO sessions (started_at, duration_sec, elapsed_sec, message, cycle, focused_sec, distracted_sec, tag)" ++
+                " VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         ) orelse {
             self.execSimple("ROLLBACK");
             return;
         };
-        _ = self.api.bind_text(stmt, 1, started_at.ptr, @intCast(started_at.len), transient);
-        _ = self.api.bind_int64(stmt, 2, @intCast(duration_sec));
-        _ = self.api.bind_text(stmt, 3, message.ptr, @intCast(message.len), transient);
-        _ = self.api.bind_int64(stmt, 4, cycle);
-        _ = self.api.bind_int64(stmt, 5, @intCast(focused_sec));
-        _ = self.api.bind_int64(stmt, 6, @intCast(distracted_sec));
-        _ = self.api.bind_text(stmt, 7, tag.ptr, @intCast(tag.len), transient);
+        _ = self.api.bind_text(stmt, 1, s.started_at.ptr, @intCast(s.started_at.len), transient);
+        _ = self.api.bind_int64(stmt, 2, @intCast(s.duration_sec));
+        _ = self.api.bind_int64(stmt, 3, @intCast(s.elapsed_sec));
+        _ = self.api.bind_text(stmt, 4, s.message.ptr, @intCast(s.message.len), transient);
+        _ = self.api.bind_int64(stmt, 5, s.cycle);
+        _ = self.api.bind_int64(stmt, 6, @intCast(s.focused_sec));
+        _ = self.api.bind_int64(stmt, 7, @intCast(s.distracted_sec));
+        _ = self.api.bind_text(stmt, 8, s.tag.ptr, @intCast(s.tag.len), transient);
         const session_ok = self.api.step(stmt) == sqlite_done;
         _ = self.api.finalize(stmt);
         if (!session_ok) {
@@ -140,7 +156,7 @@ pub const Db = struct {
         }
         const session_id = self.api.last_insert_rowid(self.handle);
 
-        for (rows) |row| {
+        for (s.rows) |row| {
             stmt = self.prepare(
                 "INSERT INTO app_usage (session_id, app, seconds, allowed) VALUES (?1, ?2, ?3, ?4)",
             ) orelse continue;
@@ -155,26 +171,74 @@ pub const Db = struct {
         self.execSimple("COMMIT");
     }
 
+    // --- Persisted allow list -----------------------------------------
+
+    pub fn allowAdd(self: *Db, pattern: []const u8) void {
+        const stmt = self.prepare("INSERT OR IGNORE INTO allow_list (pattern) VALUES (?1)") orelse return;
+        defer _ = self.api.finalize(stmt);
+        _ = self.api.bind_text(stmt, 1, pattern.ptr, @intCast(pattern.len), transient);
+        _ = self.api.step(stmt);
+    }
+
+    pub fn allowRemove(self: *Db, pattern: []const u8) void {
+        const stmt = self.prepare("DELETE FROM allow_list WHERE pattern = ?1 COLLATE NOCASE") orelse return;
+        defer _ = self.api.finalize(stmt);
+        _ = self.api.bind_text(stmt, 1, pattern.ptr, @intCast(pattern.len), transient);
+        _ = self.api.step(stmt);
+    }
+
+    /// Loads the persisted allow list; caller owns the returned slice
+    /// and its strings (allocated from `alloc`).
+    pub fn loadAllow(self: *Db, alloc: std.mem.Allocator) []const []const u8 {
+        var list = std.ArrayList([]const u8).empty;
+        const stmt = self.prepare("SELECT pattern FROM allow_list ORDER BY pattern") orelse return &.{};
+        defer _ = self.api.finalize(stmt);
+        while (self.api.step(stmt) == sqlite_row) {
+            const p = alloc.dupe(u8, self.columnText(stmt, 0)) catch continue;
+            list.append(alloc, p) catch continue;
+        }
+        return list.toOwnedSlice(alloc) catch &.{};
+    }
+
+    pub fn printAllow(self: *Db, w: *Writer) void {
+        const stmt = self.prepare("SELECT pattern FROM allow_list ORDER BY pattern") orelse return;
+        defer _ = self.api.finalize(stmt);
+        var any = false;
+        while (self.api.step(stmt) == sqlite_row) {
+            w.print("  {s}\n", .{self.columnText(stmt, 0)}) catch return;
+            any = true;
+        }
+        if (!any) w.print("(allow list is empty)\n", .{}) catch return;
+    }
+
+    // --- Reports -------------------------------------------------------
+
     /// `sowon history [N]`: the N most recent sessions, newest first.
-    pub fn printHistory(self: *Db, limit: u32) void {
+    pub fn printHistory(self: *Db, w: *Writer, limit: u32) void {
         const stmt = self.prepare(
-            "SELECT started_at, duration_sec, tag, message, focused_sec, distracted_sec" ++
+            "SELECT started_at, duration_sec, elapsed_sec, tag, message, focused_sec, distracted_sec" ++
                 " FROM sessions ORDER BY id DESC LIMIT ?1",
         ) orelse return;
         defer _ = self.api.finalize(stmt);
         _ = self.api.bind_int64(stmt, 1, limit);
 
-        std.debug.print("{s:<19}  {s:>9}  {s:>5}  {s:<12}  {s}\n", .{
-            "started", "length", "focus", "tag", "message",
-        });
+        w.print("{s:<19}  {s:>9}  {s:>9}  {s:>5}  {s:<12}  {s}\n", .{
+            "started", "active", "elapsed", "focus", "tag", "message",
+        }) catch return;
+
         var dur_buf: [64]u8 = undefined;
+        var el_buf: [64]u8 = undefined;
         while (self.api.step(stmt) == sqlite_row) {
             const started = self.columnText(stmt, 0);
-            const dur = fmtDur(&dur_buf, @intCast(self.api.column_int64(stmt, 1))) catch "?";
-            const tag = self.columnText(stmt, 2);
-            const message = self.columnText(stmt, 3);
-            const focused: u64 = @intCast(self.api.column_int64(stmt, 4));
-            const distracted: u64 = @intCast(self.api.column_int64(stmt, 5));
+            const dur = util.fmtDur(&dur_buf, @intCast(self.api.column_int64(stmt, 1))) catch "?";
+            const elapsed_raw: u64 = @intCast(self.api.column_int64(stmt, 2));
+            // Older rows predate elapsed tracking (stored 0): fall back
+            // to the active duration so the column is never blank.
+            const elapsed = util.fmtDur(&el_buf, if (elapsed_raw > 0) elapsed_raw else @intCast(self.api.column_int64(stmt, 1))) catch "?";
+            const tag = self.columnText(stmt, 3);
+            const message = self.columnText(stmt, 4);
+            const focused: u64 = @intCast(self.api.column_int64(stmt, 5));
+            const distracted: u64 = @intCast(self.api.column_int64(stmt, 6));
 
             var pct_buf: [8]u8 = undefined;
             const tracked = focused + distracted;
@@ -182,9 +246,9 @@ pub const Db = struct {
                 std.fmt.bufPrint(&pct_buf, "{d}%", .{focused * 100 / tracked}) catch "-"
             else
                 "-";
-            std.debug.print("{s:<19}  {s:>9}  {s:>5}  {s:<12}  {s}\n", .{
-                started, dur, pct, tag, message,
-            });
+            w.print("{s:<19}  {s:>9}  {s:>9}  {s:>5}  {s:<12}  {s}\n", .{
+                started, dur, elapsed, pct, tag, message,
+            }) catch return;
         }
     }
 
@@ -196,7 +260,7 @@ pub const Db = struct {
     /// The local "today" anchor is computed here with GetLocalTime and
     /// passed into SQL, because winsqlite3.dll is built without the
     /// 'localtime' modifier (it returns NULL).
-    pub fn printReport(self: *Db, range: Range, tag: []const u8) void {
+    pub fn printReport(self: *Db, w: *Writer, range: Range, tag: []const u8) void {
         var st: w32.SYSTEMTIME = undefined;
         w32.GetLocalTime(&st);
         var today_buf: [16]u8 = undefined;
@@ -213,11 +277,11 @@ pub const Db = struct {
             .week => "last 7 days",
         };
 
-        var dur_bufs: [3][64]u8 = undefined;
+        var dur_bufs: [4][64]u8 = undefined;
         {
             const stmt = self.prepare(
                 "SELECT COUNT(*), COALESCE(SUM(duration_sec),0), COALESCE(SUM(focused_sec),0)," ++
-                    " COALESCE(SUM(distracted_sec),0) FROM sessions" ++
+                    " COALESCE(SUM(distracted_sec),0), COALESCE(SUM(elapsed_sec),0) FROM sessions" ++
                     " WHERE started_at >= date(?1,?2) AND (?3 = '' OR tag = ?3)",
             ) orelse return;
             defer _ = self.api.finalize(stmt);
@@ -230,26 +294,29 @@ pub const Db = struct {
             const total: u64 = @intCast(self.api.column_int64(stmt, 1));
             const focused: u64 = @intCast(self.api.column_int64(stmt, 2));
             const distracted: u64 = @intCast(self.api.column_int64(stmt, 3));
+            const elapsed: u64 = @intCast(self.api.column_int64(stmt, 4));
 
             if (tag.len > 0) {
-                std.debug.print("=== sowon report: {s}, tag [{s}] ===\n", .{ label, tag });
+                w.print("=== sowon report: {s}, tag [{s}] ===\n", .{ label, tag }) catch return;
             } else {
-                std.debug.print("=== sowon report: {s} ===\n", .{label});
+                w.print("=== sowon report: {s} ===\n", .{label}) catch return;
             }
-            std.debug.print("sessions: {d}   work time: {s}\n", .{
-                count, fmtDur(&dur_bufs[0], total) catch "?",
-            });
+            w.print("sessions: {d}   active work: {s}   elapsed: {s}\n", .{
+                count,
+                util.fmtDur(&dur_bufs[0], total) catch "?",
+                util.fmtDur(&dur_bufs[3], if (elapsed > 0) elapsed else total) catch "?",
+            }) catch return;
             const tracked = focused + distracted;
             if (tracked > 0) {
-                std.debug.print("focus score: {d}%  (focused {s} / distracted {s})\n", .{
+                w.print("focus score: {d}%  (focused {s} / distracted {s})\n", .{
                     focused * 100 / tracked,
-                    fmtDur(&dur_bufs[1], focused) catch "?",
-                    fmtDur(&dur_bufs[2], distracted) catch "?",
-                });
+                    util.fmtDur(&dur_bufs[1], focused) catch "?",
+                    util.fmtDur(&dur_bufs[2], distracted) catch "?",
+                }) catch return;
             }
         }
 
-        std.debug.print("\ntop apps:\n", .{});
+        w.print("\ntop apps:\n", .{}) catch return;
         const stmt = self.prepare(
             "SELECT app, SUM(seconds) AS s, MAX(allowed) FROM app_usage" ++
                 " JOIN sessions ON sessions.id = app_usage.session_id" ++
@@ -266,8 +333,8 @@ pub const Db = struct {
             const name = self.columnText(stmt, 0);
             const secs: u64 = @intCast(self.api.column_int64(stmt, 1));
             const mark: []const u8 = if (self.api.column_int64(stmt, 2) != 0) "+" else " ";
-            const dur = fmtDur(&dur_buf, secs) catch continue;
-            std.debug.print("{s:>11} {s} {s}\n", .{ dur, mark, name });
+            const dur = util.fmtDur(&dur_buf, secs) catch continue;
+            w.print("{s:>11} {s} {s}\n", .{ dur, mark, name }) catch return;
         }
     }
 
@@ -297,15 +364,6 @@ pub const Db = struct {
         _ = self.api.exec(self.handle, sql, null, null, &errmsg);
     }
 };
-
-fn fmtDur(buf: []u8, secs: u64) ![]const u8 {
-    const h = secs / 3600;
-    const m = secs / 60 % 60;
-    const s = secs % 60;
-    if (h > 0) return std.fmt.bufPrint(buf, "{d}h {d:0>2}m {d:0>2}s", .{ h, m, s });
-    if (m > 0) return std.fmt.bufPrint(buf, "{d}m {d:0>2}s", .{ m, s });
-    return std.fmt.bufPrint(buf, "{d}s", .{s});
-}
 
 fn loadApi() ?Api {
     const lib = w32.LoadLibraryW(L("winsqlite3.dll")) orelse return null;

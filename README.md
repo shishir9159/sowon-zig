@@ -27,11 +27,28 @@ Build options:
 | `-Dshader-backend=none\|zig` | Shader toolchain. `zig` compiles the shaders with the Zig compiler itself; it is the default for `-Drenderer=spirv`. Rejected with `gdi`. |
 | `SOWON_SAMPLE_INTERVAL=<seconds>` (env var) | Foreground-app sampling interval, baked in at build time. Default `10`. |
 
-Run the unit tests (pure helpers + protobuf decoder):
+## Tests
 
 ```powershell
 zig build test
 ```
+
+Covers the modules that run headless:
+
+| Module | What is tested |
+| --- | --- |
+| `src/util.zig` | duration parsing, duration formatting, allow-list matching |
+| `src/server.zig` | HTTP request framing, gRPC-Web frames, protobuf decoding, UTF-8 truncation, focus-snapshot formatting |
+| `src/chime.zig` | RIFF/WAV header correctness, sample counts, normalisation without clipping |
+| `src/digits.zig` | sprite-atlas tint + premultiplied-alpha maths |
+
+`main.zig` and the renderers need a live window, so they are exercised by
+running the app rather than by unit tests. The browser extension has its own
+suite in `bell-bearer/tests/` (open `tests/index.html` in Chrome).
+
+The protobuf `FocusUpdate` wire format is pinned from **both** sides: the Zig
+`decodeFocusUpdate` test and the extension's `encodeFocusUpdateFrame` test
+assert the same byte sequence, so the two halves cannot drift apart silently.
 
 ## SPIR-V renderer
 

@@ -88,3 +88,78 @@ fn build(alloc: std.mem.Allocator, notes: []const Note, total_seconds: f64) ![]u
 
     return wav;
 }
+
+const testing = std.testing;
+
+/// Parses the parts of the RIFF header the Windows audio APIs rely on.
+fn expectValidWav(wav: []const u8, expect_seconds: f64) !void {
+    try testing.expect(wav.len > 44);
+    try testing.expectEqualStrings("RIFF", wav[0..4]);
+    try testing.expectEqualStrings("WAVE", wav[8..12]);
+    try testing.expectEqualStrings("fmt ", wav[12..16]);
+    try testing.expectEqualStrings("data", wav[36..40]);
+
+    // RIFF size must cover everything after the first 8 bytes.
+    try testing.expectEqual(
+        @as(u32, @intCast(wav.len - 8)),
+        std.mem.readInt(u32, wav[4..8], .little),
+    );
+    // data chunk size must match the actual payload.
+    const data_len = std.mem.readInt(u32, wav[40..44], .little);
+    try testing.expectEqual(@as(usize, data_len), wav.len - 44);
+
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, wav[20..22], .little)); // PCM
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, wav[22..24], .little)); // mono
+    try testing.expectEqual(@as(u16, 16), std.mem.readInt(u16, wav[34..36], .little)); // bits
+    try testing.expectEqual(sample_rate, std.mem.readInt(u32, wav[24..28], .little));
+    // byte rate = sample_rate * channels * bytes-per-sample
+    try testing.expectEqual(sample_rate * 2, std.mem.readInt(u32, wav[28..32], .little));
+    try testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, wav[32..34], .little)); // block align
+
+    const expected_samples: usize = @intFromFloat(expect_seconds * @as(f64, sample_rate));
+    try testing.expectEqual(expected_samples, data_len / 2);
+}
+
+test "buildWav produces a valid 2.4s mono PCM chime" {
+    const wav = try buildWav(testing.allocator);
+    defer testing.allocator.free(wav);
+    try expectValidWav(wav, 2.4);
+}
+
+test "buildBreakWav and buildNudgeWav are valid and shorter" {
+    const brk = try buildBreakWav(testing.allocator);
+    defer testing.allocator.free(brk);
+    try expectValidWav(brk, 1.2);
+
+    const nudge = try buildNudgeWav(testing.allocator);
+    defer testing.allocator.free(nudge);
+    try expectValidWav(nudge, 0.5);
+
+    try testing.expect(nudge.len < brk.len);
+}
+
+test "chime is normalised: peaks near full scale but never clips" {
+    const wav = try buildWav(testing.allocator);
+    defer testing.allocator.free(wav);
+
+    var peak: i32 = 0;
+    var i: usize = 44;
+    while (i + 1 < wav.len) : (i += 2) {
+        const v: i32 = std.mem.readInt(i16, wav[i..][0..2], .little);
+        const mag: i32 = @intCast(@abs(v));
+        peak = @max(peak, mag);
+    }
+
+    // peak_amplitude is 0.7 of full scale, so expect ~22937.
+    const expected: i32 = @intFromFloat(peak_amplitude * 32767.0);
+    try testing.expect(peak <= 32767); // never clips
+    try testing.expect(peak > expected - 200); // and is actually normalised
+    try testing.expect(peak < expected + 200);
+}
+
+test "chime starts near silence so there is no click" {
+    const wav = try buildWav(testing.allocator);
+    defer testing.allocator.free(wav);
+    const first = std.mem.readInt(i16, wav[44..46], .little);
+    try testing.expect(@abs(@as(i32, first)) < 500);
+}

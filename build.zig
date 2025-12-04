@@ -121,10 +121,17 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run sowon");
     run_step.dependOn(&run_cmd.step);
 
-    // `zig build test`: unit tests for the pure helpers and the
-    // protobuf decoder. These modules have no OS/global-state deps.
+    // `zig build test`: unit tests for the modules that can run headless.
+    // (main.zig and the renderers need a window and are covered by running
+    // the app; the browser-extension side has its own suite in
+    // bell-bearer/tests/.)
     const test_step = b.step("test", "Run unit tests");
-    for ([_][]const u8{ "src/util.zig", "src/server.zig" }) |src| {
+    for ([_][]const u8{
+        "src/util.zig", // duration parsing, formatting, allow-list matching
+        "src/server.zig", // HTTP + gRPC-Web + protobuf decoding
+        "src/chime.zig", // synthesized WAV correctness
+        "src/digits.zig", // sprite atlas premultiply maths
+    }) |src| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(src),
@@ -132,6 +139,10 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
+        // server.zig pulls in the Win32 externs (SRWLOCK, winsock).
+        t.root_module.linkSystemLibrary("kernel32", .{});
+        t.root_module.linkSystemLibrary("user32", .{});
+        t.root_module.linkSystemLibrary("ws2_32", .{});
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
 }

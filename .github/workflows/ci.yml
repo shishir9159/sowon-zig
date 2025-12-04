@@ -1,0 +1,26 @@
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+      - name: unit tests
+        run: zig build test
+      - name: build (gdi, ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+      - name: build (spirv)
+        run: zig build -Drenderer=spirv
+      - name: check stub renderers still fail cleanly
+        shell: pwsh
+        run: |
+          $out = zig build -Drenderer=sdl 2>&1 | Out-String
+          if ($out -notmatch 'not implemented') {
+            Write-Error "sdl stub did not produce the expected message"
+            exit 1
+          }

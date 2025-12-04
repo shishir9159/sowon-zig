@@ -146,14 +146,19 @@ fn handleRpc(request: Request) bool {
     if (body.len < 5 + msg_len) return false;
 
     const update = decodeFocusUpdate(body[5..][0..msg_len]) orelse return false;
+    storeSnapshot(update.tab_group, update.tab_title, update.domain);
+    return true;
+}
 
+/// Replaces the current browser-focus snapshot. Split out from handleRpc so
+/// it can be driven directly by tests.
+fn storeSnapshot(group: []const u8, title: []const u8, domain: []const u8) void {
     w32.AcquireSRWLockExclusive(&lock);
     defer w32.ReleaseSRWLockExclusive(&lock);
-    group_len = copyValidUtf8(&group_buf, std.mem.trim(u8, update.tab_group, " \r\n"));
-    title_len = copyValidUtf8(&title_buf, std.mem.trim(u8, update.tab_title, " \r\n"));
-    domain_len = copyValidUtf8(&domain_buf, std.mem.trim(u8, update.domain, " \r\n"));
+    group_len = copyValidUtf8(&group_buf, std.mem.trim(u8, group, " \r\n"));
+    title_len = copyValidUtf8(&title_buf, std.mem.trim(u8, title, " \r\n"));
+    domain_len = copyValidUtf8(&domain_buf, std.mem.trim(u8, domain, " \r\n"));
     have_data = true;
-    return true;
 }
 
 const FocusUpdate = struct {
@@ -248,20 +253,182 @@ fn copyValidUtf8(dst: []u8, src: []const u8) usize {
     return n;
 }
 
+const testing = std.testing;
+
 test decodeFocusUpdate {
     // FocusUpdate { tab_group: "Research", tab_title: "Zig docs", domain: "ziglang.org" }
+    //
+    // NOTE: these exact bytes are asserted from the other side of the wire by
+    // the JS test "encodeFocusUpdateFrame matches the wire format sowon
+    // decodes" in the bell-bearer extension's tests/background.test.js. The
+    // two together pin the cross-language contract.
     const msg = "\x0a\x08Research\x12\x08Zig docs\x1a\x0bziglang.org";
     const update = decodeFocusUpdate(msg).?;
-    try std.testing.expectEqualStrings("Research", update.tab_group);
-    try std.testing.expectEqualStrings("Zig docs", update.tab_title);
-    try std.testing.expectEqualStrings("ziglang.org", update.domain);
+    try testing.expectEqualStrings("Research", update.tab_group);
+    try testing.expectEqualStrings("Zig docs", update.tab_title);
+    try testing.expectEqualStrings("ziglang.org", update.domain);
 
     // Empty group, unknown extra varint field (3 << 3 | 0), title only.
     const msg2 = "\x18\x2a\x12\x05Hello";
     const update2 = decodeFocusUpdate(msg2).?;
-    try std.testing.expectEqualStrings("", update2.tab_group);
-    try std.testing.expectEqualStrings("Hello", update2.tab_title);
+    try testing.expectEqualStrings("", update2.tab_group);
+    try testing.expectEqualStrings("Hello", update2.tab_title);
 
     // Truncated length prefix must fail, not crash.
-    try std.testing.expect(decodeFocusUpdate("\x0a\xff") == null);
+    try testing.expect(decodeFocusUpdate("\x0a\xff") == null);
+}
+
+test "decodeFocusUpdate: empty message yields empty fields" {
+    const update = decodeFocusUpdate("").?;
+    try testing.expectEqualStrings("", update.tab_group);
+    try testing.expectEqualStrings("", update.tab_title);
+    try testing.expectEqualStrings("", update.domain);
+}
+
+test "decodeFocusUpdate: zero-length string fields are valid" {
+    // field 1 len 0, field 2 len 0, field 3 len 0
+    const update = decodeFocusUpdate("\x0a\x00\x12\x00\x1a\x00").?;
+    try testing.expectEqualStrings("", update.tab_group);
+    try testing.expectEqualStrings("", update.tab_title);
+}
+
+test "decodeFocusUpdate: multi-byte varint length" {
+    // A 300-byte title: tag 0x12, varint length 300 = 0xAC 0x02.
+    var buf: [3 + 300]u8 = undefined;
+    buf[0] = 0x12;
+    buf[1] = 0xac;
+    buf[2] = 0x02;
+    @memset(buf[3..], 'x');
+    const update = decodeFocusUpdate(&buf).?;
+    try testing.expectEqual(@as(usize, 300), update.tab_title.len);
+}
+
+test "decodeFocusUpdate: rejects a length running past the buffer" {
+    // Claims 200 bytes of payload but only supplies 3.
+    try testing.expect(decodeFocusUpdate("\x12\xc8\x01abc") == null);
+}
+
+test "decodeFocusUpdate: skips unknown fixed32/fixed64 fields" {
+    // field 4 fixed32 (4<<3|5 = 0x25), then field 2 string.
+    const with32 = "\x25\x01\x02\x03\x04\x12\x02hi";
+    try testing.expectEqualStrings("hi", decodeFocusUpdate(with32).?.tab_title);
+
+    // field 5 fixed64 (5<<3|1 = 0x29), then field 2 string.
+    const with64 = "\x29\x01\x02\x03\x04\x05\x06\x07\x08\x12\x02hi";
+    try testing.expectEqualStrings("hi", decodeFocusUpdate(with64).?.tab_title);
+}
+
+test "decodeFocusUpdate: truncated fixed-width field fails cleanly" {
+    try testing.expect(decodeFocusUpdate("\x25\x01\x02") == null); // fixed32, 2 bytes left
+    try testing.expect(decodeFocusUpdate("\x29\x01\x02\x03") == null); // fixed64, 4 bytes left
+}
+
+test "decodeFocusUpdate: rejects an over-long varint" {
+    // Ten continuation bytes: malformed, must not loop or overflow the shift.
+    try testing.expect(decodeFocusUpdate("\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff") == null);
+}
+
+test "readVarint: boundary values" {
+    var i: usize = 0;
+    i = 0;
+    try testing.expectEqual(@as(u64, 0), readVarint("\x00", &i).?);
+    i = 0;
+    try testing.expectEqual(@as(u64, 127), readVarint("\x7f", &i).?);
+    i = 0;
+    try testing.expectEqual(@as(u64, 128), readVarint("\x80\x01", &i).?);
+    i = 0;
+    try testing.expectEqual(@as(u64, 300), readVarint("\xac\x02", &i).?);
+    // Runs off the end of the buffer.
+    i = 0;
+    try testing.expect(readVarint("\x80", &i) == null);
+}
+
+test "completeRequest: returns null until headers and body are complete" {
+    // Headers not terminated yet.
+    try testing.expect(completeRequest("POST /x HTTP/1.1\r\nContent-Length: 5\r\n") == null);
+    // Headers complete but body short.
+    try testing.expect(completeRequest("POST /x HTTP/1.1\r\nContent-Length: 5\r\n\r\nab") == null);
+}
+
+test "completeRequest: parses path and body" {
+    const raw = "POST " ++ method_path ++ " HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+    const req = completeRequest(raw).?;
+    try testing.expectEqualStrings(method_path, req.path);
+    try testing.expectEqualStrings("hello", req.body);
+}
+
+test "completeRequest: Content-Length header is case-insensitive" {
+    const raw = "POST /p HTTP/1.1\r\ncOnTeNt-LeNgTh:  3\r\n\r\nabc";
+    const req = completeRequest(raw).?;
+    try testing.expectEqualStrings("abc", req.body);
+}
+
+test "completeRequest: missing Content-Length means an empty body" {
+    const req = completeRequest("GET /p HTTP/1.1\r\nHost: x\r\n\r\n").?;
+    try testing.expectEqualStrings("/p", req.path);
+    try testing.expectEqualStrings("", req.body);
+}
+
+test "handleRpc: accepts a well-formed gRPC-Web frame on the right path" {
+    const payload = "\x0a\x04Work\x12\x03Zig\x1a\x07zig.org";
+    var body: [5 + payload.len]u8 = undefined;
+    body[0] = 0; // uncompressed data frame
+    std.mem.writeInt(u32, body[1..5], payload.len, .big);
+    @memcpy(body[5..], payload);
+
+    try testing.expect(handleRpc(.{ .path = method_path, .body = &body }));
+
+    // The decoded snapshot is what the tracker will report.
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("chrome [Work] zig.org", chromeContext(&buf).?);
+}
+
+test "handleRpc: rejects the wrong method path" {
+    const body = "\x00\x00\x00\x00\x00";
+    try testing.expect(!handleRpc(.{ .path = "/wrong/Path", .body = body }));
+}
+
+test "handleRpc: rejects malformed frames" {
+    try testing.expect(!handleRpc(.{ .path = method_path, .body = "" })); // too short
+    try testing.expect(!handleRpc(.{ .path = method_path, .body = "\x01\x00\x00\x00\x00" })); // compressed flag
+    // Length prefix longer than the actual payload.
+    try testing.expect(!handleRpc(.{ .path = method_path, .body = "\x00\x00\x00\x00\x64ab" }));
+}
+
+test "chromeContext: prefers domain, falls back to title, formats groups" {
+    var buf: [256]u8 = undefined;
+
+    // Ungrouped tab with a domain.
+    storeSnapshot("", "Some Page Title", "example.com");
+    try testing.expectEqualStrings("chrome: example.com", chromeContext(&buf).?);
+
+    // Grouped tab with a domain.
+    storeSnapshot("Research", "Some Page Title", "example.com");
+    try testing.expectEqualStrings("chrome [Research] example.com", chromeContext(&buf).?);
+
+    // No domain (chrome:// page): fall back to the title.
+    storeSnapshot("", "Settings", "");
+    try testing.expectEqualStrings("chrome: Settings", chromeContext(&buf).?);
+
+    // Nothing usable at all.
+    storeSnapshot("", "", "");
+    try testing.expect(chromeContext(&buf) == null);
+}
+
+test "copyValidUtf8: truncates without splitting a UTF-8 sequence" {
+    var dst: [4]u8 = undefined;
+    // "é" is 2 bytes; 3 of them do not fit in 4 bytes cleanly at the boundary.
+    const n = copyValidUtf8(&dst, "ééé");
+    try testing.expect(std.unicode.utf8ValidateSlice(dst[0..n]));
+    try testing.expectEqual(@as(usize, 4), n);
+
+    // A lone continuation byte can never be valid, so nothing is copied.
+    var dst2: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), copyValidUtf8(&dst2, "\x80"));
+}
+
+test "copyValidUtf8: copies short ASCII wholesale" {
+    var dst: [64]u8 = undefined;
+    const n = copyValidUtf8(&dst, "hello");
+    try testing.expectEqualStrings("hello", dst[0..n]);
 }

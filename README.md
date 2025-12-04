@@ -23,8 +23,8 @@ Build options:
 
 | Option | Meaning |
 | --- | --- |
-| `-Drenderer=gdi\|opengl\|vulkan\|sdl\|glfw` | Rendering backend to compile in. Only `gdi` is implemented; the others are compile-checked stubs. Only the selected backend is compiled. |
-| `-Dshader-backend=none\|slang` | Shader toolchain for GPU renderers. Rejected with `gdi`. |
+| `-Drenderer=gdi\|opengl\|spirv\|sdl\|glfw` | Rendering backend to compile in. Only the selected backend is compiled. `gdi` is complete; `spirv` has working shaders but no Vulkan host layer yet (see below); the rest are compile-checked stubs. |
+| `-Dshader-backend=none\|zig` | Shader toolchain. `zig` compiles the shaders with the Zig compiler itself; it is the default for `-Drenderer=spirv`. Rejected with `gdi`. |
 | `SOWON_SAMPLE_INTERVAL=<seconds>` (env var) | Foreground-app sampling interval, baked in at build time. Default `10`. |
 
 Run the unit tests (pure helpers + protobuf decoder):
@@ -32,6 +32,71 @@ Run the unit tests (pure helpers + protobuf decoder):
 ```powershell
 zig build test
 ```
+
+## SPIR-V renderer
+
+`-Drenderer=spirv` selects a Vulkan backend whose shaders are written **in Zig**
+([src/render/shaders/sprite.zig](src/render/shaders/sprite.zig)) and compiled to
+SPIR-V by the Zig compiler itself:
+
+```powershell
+zig build -Drenderer=spirv
+```
+
+That produces a real Vulkan SPIR-V module — both entry points in one binary,
+with `BuiltIn Position` / `BuiltIn VertexIndex`, `Location` varyings, and
+`DescriptorSet`/`Binding` for the glyph atlas. The module is embedded in the
+executable and its magic number is asserted at compile time, so a broken shader
+toolchain fails the build instead of showing a black window.
+
+**Status:** the shader half is done and verified. The Vulkan *host* layer
+(instance, surface, swapchain, pipeline, command buffers, atlas upload) is not
+written yet, so running a `spirv` build prints a clear message and exits. Use
+`-Drenderer=gdi` for day-to-day use.
+
+### Dev dependencies for SPIR-V
+
+The short version: **you do not need the Vulkan SDK to build.**
+
+| Requirement | Needed for | How to get it |
+| --- | --- | --- |
+| Zig 0.16 | Compiling the shaders to SPIR-V | Already required to build sowon |
+| GPU driver with Vulkan (`vulkan-1.dll`) | *Running* a `spirv` build | Ships with any current NVIDIA / AMD / Intel driver. Verify with `vulkaninfo --summary` |
+| Vulkan SDK | Optional — validation layers, `spirv-dis`, `spirv-val` | <https://vulkan.lunarg.com/sdk/home> |
+
+Notes:
+
+- **No `glslc`, `DXC` or `slangc`.** Shaders are Zig source compiled with
+  `zig build-obj -target spirv64-vulkan -ofmt=spirv`, driven by `build.zig`.
+- **No `vulkan-1.lib`.** The host layer loads `vulkan-1.dll` at runtime with
+  `LoadLibrary`/`GetProcAddress` (the same trick [db.zig](src/db.zig) uses for
+  `winsqlite3.dll`), so the SDK's import library is not required either.
+- Install the SDK only if you want validation layers while developing the host
+  layer — strongly recommended for that work, since Vulkan errors are otherwise
+  silent. After installing, `VULKAN_SDK` is set and `spirv-val` / `spirv-dis`
+  land on `PATH`:
+
+  ```powershell
+  spirv-val  .\zig-cache\o\<hash>\sprite.spv   # validate the module
+  spirv-dis  .\zig-cache\o\<hash>\sprite.spv   # human-readable SPIR-V
+  ```
+
+### Zig 0.16 SPIR-V caveats
+
+Two compiler bugs are worked around in `build.zig`; both are pinned there with
+comments so they can be lifted when upstream fixes them:
+
+1. **Shaders must be built in `Debug`.** Every release mode
+   (`ReleaseFast`/`ReleaseSafe`/`ReleaseSmall`) crashes the SPIR-V backend and
+   silently emits a **0-byte** module. Harmless in practice — drivers optimise
+   SPIR-V themselves.
+2. **The build server can't emit SPIR-V.** Going through `b.addObject` fails
+   with `error: failed to write: NotOpenForWriting`, so `build.zig` invokes
+   `zig build-obj … -femit-bin=…` as a plain subprocess instead.
+
+Also note `std.gpu.executionMode()` is currently broken (`cannot set execution
+mode in assembly`), but it isn't needed: the compiler emits `OpExecutionMode`
+for fragment entry points automatically.
 
 ## Timer usage
 

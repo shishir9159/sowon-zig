@@ -23,7 +23,7 @@ const idle_threshold_secs: u64 = 120;
 const renderer = switch (build_options.renderer) {
     .gdi => @import("render/gdi.zig"),
     .opengl => @import("render/opengl.zig"),
-    .vulkan => @import("render/vulkan.zig"),
+    .spirv => @import("render/spirv.zig"),
     .sdl => @import("render/sdl.zig"),
     .glfw => @import("render/glfw.zig"),
 };

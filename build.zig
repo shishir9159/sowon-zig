@@ -1,7 +1,7 @@
 const std = @import("std");
 
-pub const Renderer = enum { gdi, opengl, vulkan, sdl, glfw };
-pub const ShaderBackend = enum { none, slang };
+pub const Renderer = enum { gdi, opengl, spirv, sdl, glfw };
+pub const ShaderBackend = enum { none, zig, slang };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -23,15 +23,24 @@ pub fn build(b: *std.Build) void {
         "Rendering backend to compile in (default: gdi)",
     ) orelse .gdi;
 
+    // Shader toolchain. 'zig' compiles the shaders in src/render/shaders/
+    // to SPIR-V with the Zig compiler itself — no Vulkan SDK, glslc or DXC
+    // required. It is the default (and currently only) choice for -Drenderer=spirv.
     const shader_backend = b.option(
         ShaderBackend,
         "shader-backend",
-        "Shader toolchain for GPU renderers (default: none)",
-    ) orelse .none;
+        "Shader toolchain for GPU renderers (default: zig for spirv, none otherwise)",
+    ) orelse if (renderer == .spirv) ShaderBackend.zig else ShaderBackend.none;
 
-    if (shader_backend == .slang and renderer == .gdi) {
+    if (shader_backend != .none and (renderer == .gdi)) {
         std.process.fatal(
-            "-Dshader-backend=slang requires a GPU renderer (-Drenderer=opengl|vulkan|sdl|glfw); gdi does not run shaders",
+            "-Dshader-backend={s} requires a GPU renderer (-Drenderer=spirv|opengl|sdl|glfw); gdi does not run shaders",
+            .{@tagName(shader_backend)},
+        );
+    }
+    if (shader_backend == .slang) {
+        std.process.fatal(
+            "-Dshader-backend=slang is not wired up; the spirv backend compiles its shaders with -Dshader-backend=zig",
             .{},
         );
     }
@@ -66,12 +75,44 @@ pub fn build(b: *std.Build) void {
             exe.root_module.linkSystemLibrary("opengl32", .{});
             exe.root_module.linkSystemLibrary("gdi32", .{}); // wgl pixel formats
         },
-        // Stub backends: link their libraries (vulkan-1, SDL, GLFW)
-        // here once they get an implementation. Linking now would just
-        // mask the stub's "not implemented" compile error with a
-        // missing-library linker error.
-        .vulkan, .sdl, .glfw => {},
+        // Nothing to link: the host layer loads vulkan-1.dll at runtime with
+        // LoadLibrary/GetProcAddress (as db.zig does for winsqlite3.dll), so
+        // no Vulkan SDK import library is needed to build.
+        .spirv => {},
+        // Stub backends: link their libraries (SDL, GLFW) here once they
+        // get an implementation. Linking now would just mask the stub's
+        // "not implemented" compile error with a missing-library error.
+        .sdl, .glfw => {},
     }
+
+    // Compile the Zig shaders to SPIR-V with the Zig compiler and embed the
+    // resulting module in the executable. Runs only for -Drenderer=spirv, so
+    // no other build pays for it.
+    if (shader_backend == .zig) {
+        // Invoke the compiler directly rather than via b.addObject: on Zig
+        // 0.16.0 the SPIR-V backend cannot emit through the build server's
+        // --listen protocol and fails with "NotOpenForWriting". Driving
+        // `zig build-obj ... -femit-bin=` as a plain subprocess works.
+        const spv = b.addSystemCommand(&.{
+            b.graph.zig_exe,
+            "build-obj",
+            "-ofmt=spirv",
+            "-target",
+            "spirv64-vulkan",
+            // MUST stay Debug: every release mode crashes the SPIR-V backend
+            // on 0.16.0 and silently produces a 0-byte module. Harmless — the
+            // driver optimises SPIR-V anyway — and src/render/spirv.zig
+            // asserts the magic number, so a regression fails the build
+            // rather than the GPU.
+            "-ODebug",
+        });
+        spv.addFileArg(b.path("src/render/shaders/sprite.zig"));
+        const spv_bin = spv.addPrefixedOutputFileArg("-femit-bin=", "sprite.spv");
+
+        // Exposed to the backend as @embedFile("sprite_spv").
+        exe.root_module.addAnonymousImport("sprite_spv", .{ .root_source_file = spv_bin });
+    }
+
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

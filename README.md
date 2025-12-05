@@ -38,7 +38,7 @@ Covers the modules that run headless:
 | Module | What is tested |
 | --- | --- |
 | `src/util.zig` | duration parsing, duration formatting, allow-list matching |
-| `src/server.zig` | HTTP request framing, gRPC-Web frames, protobuf decoding, UTF-8 truncation, focus-snapshot formatting |
+| `src/server.zig` | HTTP request framing, gRPC-Web request/response frames, protobuf decoding, UTF-8 truncation, focus-snapshot formatting |
 | `src/chime.zig` | RIFF/WAV header correctness, sample counts, normalisation without clipping |
 | `src/digits.zig` | sprite-atlas tint + premultiplied-alpha maths |
 

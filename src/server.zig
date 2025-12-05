@@ -1,14 +1,3 @@
-//! gRPC-Web listener for the bell-bearer Chrome extension.
-//!
-//! Implements the unary call bellbearer.FocusService/ReportFocus defined
-//! in proto/bell-bearer.proto over gRPC-Web (application/grpc-web+proto),
-//! since browsers cannot speak native gRPC. The extension POSTs a framed
-//! protobuf FocusUpdate { tab_group = 1, tab_title = 2, domain = 3 } on
-//! every focus change; the latest snapshot is kept behind a lock and
-//! read by the tracker when chrome.exe owns the foreground window.
-//!
-//! Purely optional: if nothing ever connects, sowon behaves as before.
-
 const std = @import("std");
 const w32 = @import("win32.zig");
 
@@ -22,10 +11,8 @@ var title_buf: [400]u8 = undefined;
 var title_len: usize = 0;
 var domain_buf: [200]u8 = undefined;
 var domain_len: usize = 0;
-var have_data: bool = false;
+var have_data = false;
 
-/// Spawns the listener thread. Failure is non-fatal: sowon just won't
-/// get browser detail.
 pub fn start() void {
     const thread = std.Thread.spawn(.{}, run, .{}) catch |err| {
         std.debug.print("sowon: browser listener not started: {}\n", .{err});
@@ -34,51 +21,36 @@ pub fn start() void {
     thread.detach();
 }
 
-/// Latest browser focus formatted for the usage report, or null if no
-/// extension has reported yet. `buf` must outlive the returned slice.
 pub fn chromeContext(buf: []u8) ?[]const u8 {
     w32.AcquireSRWLockExclusive(&lock);
     defer w32.ReleaseSRWLockExclusive(&lock);
-
     if (!have_data) return null;
     const group = group_buf[0..group_len];
-    // Prefer the domain as the tracking key: it aggregates cleanly
-    // (one row per site), while titles change on every page.
     const what = if (domain_len > 0) domain_buf[0..domain_len] else title_buf[0..title_len];
     if (what.len == 0) return null;
-
-    if (group.len > 0) {
-        return std.fmt.bufPrint(buf, "chrome [{s}] {s}", .{ group, what }) catch null;
-    }
+    if (group.len > 0) return std.fmt.bufPrint(buf, "chrome [{s}] {s}", .{ group, what }) catch null;
     return std.fmt.bufPrint(buf, "chrome: {s}", .{what}) catch null;
 }
 
 fn run() void {
     var wsa_data: [512]u8 align(8) = undefined;
     if (w32.WSAStartup(0x0202, &wsa_data) != 0) return;
-
     const sock = w32.socket(w32.AF_INET, w32.SOCK_STREAM, w32.IPPROTO_TCP);
     if (sock == w32.INVALID_SOCKET) return;
 
     const addr = w32.sockaddr_in{
         .sin_family = w32.AF_INET,
-        .sin_port = @byteSwap(port),
-        .sin_addr = std.mem.nativeToBig(u32, 0x7F000001), // 127.0.0.1
+        .sin_port = std.mem.nativeToBig(u16, port),
+        .sin_addr = std.mem.nativeToBig(u32, 0x7F000001),
         .sin_zero = @splat(0),
     };
-    if (w32.bind(sock, &addr, @sizeOf(w32.sockaddr_in)) != 0) return;
-    if (w32.listen(sock, 4) != 0) return;
+    if (w32.bind(sock, &addr, @sizeOf(w32.sockaddr_in)) != 0 or w32.listen(sock, 4) != 0) return;
 
+    const timeout_ms: w32.DWORD = 3000;
     while (true) {
         const conn = w32.accept(sock, null, null);
         if (conn == w32.INVALID_SOCKET) continue;
-
-        // Cap how long a single client can hold the (single-threaded)
-        // accept loop: a peer that connects but never finishes its
-        // request must not wedge the listener for the whole session.
-        const timeout_ms: w32.DWORD = 3000;
         _ = w32.setsockopt(conn, w32.SOL_SOCKET, w32.SO_RCVTIMEO, std.mem.asBytes(&timeout_ms), @sizeOf(w32.DWORD));
-
         handle(conn);
         _ = w32.closesocket(conn);
     }
@@ -87,71 +59,57 @@ fn run() void {
 fn handle(conn: w32.SOCKET) void {
     var req: [8192]u8 = undefined;
     var len: usize = 0;
-    var ok = false;
-
-    while (len < req.len) {
-        // recv returns <= 0 on close, error, or the timeout above; any
-        // of those ends this connection cleanly.
+    const ok = while (len < req.len) {
         const n = w32.recv(conn, req[len..].ptr, @intCast(req.len - len), 0);
-        if (n <= 0) break;
+        if (n <= 0) break false;
         len += @intCast(n);
-        if (completeRequest(req[0..len])) |request| {
-            ok = handleRpc(request);
-            break;
-        }
-    }
-
-    sendResponse(conn, ok);
+        if (completeRequest(req[0..len])) |request| break handleRpc(request);
+    } else false;
+    const resp = if (ok) comptime response("0") else comptime response("3");
+    _ = w32.send(conn, resp.ptr, @intCast(resp.len), 0);
 }
 
-const Request = struct {
-    path: []const u8,
-    body: []const u8,
-};
+fn response(comptime status: []const u8) []const u8 {
+    const trailer = "grpc-status: " ++ status ++ "\r\n";
+    const body = [_]u8{0} ** 5 ++ [_]u8{0x80} ++ std.mem.toBytes(std.mem.nativeToBig(u32, trailer.len)) ++ trailer;
+    const out = std.fmt.comptimePrint(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/grpc-web+proto\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        .{body.len},
+    ) ++ body;
+    return out;
+}
 
-/// Returns the parsed request once the buffer holds all of it.
+const Request = struct { path: []const u8, body: []const u8 };
+
 fn completeRequest(data: []const u8) ?Request {
     const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return null;
-    const headers = data[0..header_end];
-
-    // Request line: "POST /path HTTP/1.1"
-    const line_end = std.mem.indexOf(u8, headers, "\r\n") orelse headers.len;
-    var parts = std.mem.splitScalar(u8, headers[0..line_end], ' ');
-    _ = parts.next(); // method
+    var lines = std.mem.splitSequence(u8, data[0..header_end], "\r\n");
+    var parts = std.mem.splitScalar(u8, lines.first(), ' ');
+    _ = parts.next();
     const path = parts.next() orelse "";
 
+    const prefix = "content-length:";
     var content_len: usize = 0;
-    var it = std.mem.splitSequence(u8, headers, "\r\n");
-    while (it.next()) |line| {
-        const prefix = "content-length:";
+    while (lines.next()) |line| {
         if (line.len > prefix.len and std.ascii.startsWithIgnoreCase(line, prefix)) {
-            const value = std.mem.trim(u8, line[prefix.len..], " \t");
-            content_len = std.fmt.parseInt(usize, value, 10) catch 0;
+            content_len = std.fmt.parseInt(usize, std.mem.trim(u8, line[prefix.len..], " \t"), 10) catch 0;
         }
     }
-
     const body_start = header_end + 4;
     if (data.len < body_start + content_len) return null;
     return .{ .path = path, .body = data[body_start..][0..content_len] };
 }
 
-/// Unwraps the gRPC-Web data frame, decodes FocusUpdate, stores it.
 fn handleRpc(request: Request) bool {
-    if (!std.mem.eql(u8, request.path, method_path)) return false;
-
-    // gRPC-Web frame: 1 flag byte (0 = uncompressed data) + u32 BE length.
     const body = request.body;
-    if (body.len < 5 or body[0] != 0) return false;
+    if (!std.mem.eql(u8, request.path, method_path) or body.len < 5 or body[0] != 0) return false;
     const msg_len = std.mem.readInt(u32, body[1..5], .big);
-    if (body.len < 5 + msg_len) return false;
-
+    if (body.len - 5 < msg_len) return false;
     const update = decodeFocusUpdate(body[5..][0..msg_len]) orelse return false;
     storeSnapshot(update.tab_group, update.tab_title, update.domain);
     return true;
 }
 
-/// Replaces the current browser-focus snapshot. Split out from handleRpc so
-/// it can be driven directly by tests.
 fn storeSnapshot(group: []const u8, title: []const u8, domain: []const u8) void {
     w32.AcquireSRWLockExclusive(&lock);
     defer w32.ReleaseSRWLockExclusive(&lock);
@@ -167,37 +125,27 @@ const FocusUpdate = struct {
     domain: []const u8 = "",
 };
 
-/// Minimal proto3 decoder for FocusUpdate (two length-delimited string
-/// fields). Unknown fields are skipped per protobuf rules.
 fn decodeFocusUpdate(msg: []const u8) ?FocusUpdate {
     var update = FocusUpdate{};
     var i: usize = 0;
     while (i < msg.len) {
         const tag = readVarint(msg, &i) orelse return null;
-        const field = tag >> 3;
-        switch (@as(u3, @truncate(tag))) { // wire type
-            2 => { // length-delimited
-                const field_len = readVarint(msg, &i) orelse return null;
-                if (field_len > msg.len - i) return null;
-                const bytes = msg[i..][0..@intCast(field_len)];
-                i += @intCast(field_len);
-                switch (field) {
-                    1 => update.tab_group = bytes,
-                    2 => update.tab_title = bytes,
-                    3 => update.domain = bytes,
-                    else => {},
-                }
-            },
-            0 => _ = readVarint(msg, &i) orelse return null, // varint: skip
-            5 => { // fixed32: skip
-                if (msg.len - i < 4) return null;
-                i += 4;
-            },
-            1 => { // fixed64: skip
-                if (msg.len - i < 8) return null;
-                i += 8;
-            },
+        const len: u64 = switch (@as(u3, @truncate(tag))) {
+            0 => if (readVarint(msg, &i)) |_| 0 else return null,
+            1 => 8,
+            2 => readVarint(msg, &i) orelse return null,
+            5 => 4,
             else => return null,
+        };
+        if (len > msg.len - i) return null;
+        const bytes = msg[i..][0..@intCast(len)];
+        i += bytes.len;
+        if (tag & 7 != 2) continue;
+        switch (tag >> 3) {
+            1 => update.tab_group = bytes,
+            2 => update.tab_title = bytes,
+            3 => update.domain = bytes,
+            else => {},
         }
     }
     return update;
@@ -211,41 +159,12 @@ fn readVarint(msg: []const u8, i: *usize) ?u64 {
         i.* += 1;
         result |= @as(u64, byte & 0x7F) << shift;
         if (byte & 0x80 == 0) return result;
-        if (shift >= 56) return null; // malformed: varint too long
+        if (shift >= 56) return null;
         shift += 7;
     }
     return null;
 }
 
-/// Unary gRPC-Web response: an empty Ack data frame plus a trailers
-/// frame (flag 0x80) carrying the grpc-status. Errors are reported the
-/// gRPC way: HTTP 200 with a non-zero grpc-status in the trailers.
-fn sendResponse(conn: w32.SOCKET, ok: bool) void {
-    const trailer_ok = "grpc-status: 0\r\n";
-    const trailer_err = "grpc-status: 3\r\n"; // INVALID_ARGUMENT
-    const trailer = if (ok) trailer_ok else trailer_err;
-
-    var body: [5 + 5 + trailer_ok.len]u8 = undefined;
-    @memset(body[0..5], 0); // empty Ack message frame
-    body[5] = 0x80; // trailers frame flag
-    std.mem.writeInt(u32, body[6..10], @intCast(trailer.len), .big);
-    @memcpy(body[10..], trailer);
-
-    var head_buf: [256]u8 = undefined;
-    const head = std.fmt.bufPrint(
-        &head_buf,
-        "HTTP/1.1 200 OK\r\n" ++
-            "Content-Type: application/grpc-web+proto\r\n" ++
-            "Content-Length: {d}\r\n" ++
-            "Connection: close\r\n\r\n",
-        .{body.len},
-    ) catch return;
-
-    _ = w32.send(conn, head.ptr, @intCast(head.len), 0);
-    _ = w32.send(conn, &body, body.len, 0);
-}
-
-/// Copies src into dst, truncating without splitting a UTF-8 sequence.
 fn copyValidUtf8(dst: []u8, src: []const u8) usize {
     var n = @min(dst.len, src.len);
     while (n > 0 and !std.unicode.utf8ValidateSlice(src[0..n])) n -= 1;
@@ -255,180 +174,97 @@ fn copyValidUtf8(dst: []u8, src: []const u8) usize {
 
 const testing = std.testing;
 
-test decodeFocusUpdate {
-    // FocusUpdate { tab_group: "Research", tab_title: "Zig docs", domain: "ziglang.org" }
-    //
-    // NOTE: these exact bytes are asserted from the other side of the wire by
-    // the JS test "encodeFocusUpdateFrame matches the wire format sowon
-    // decodes" in the bell-bearer extension's tests/background.test.js. The
-    // two together pin the cross-language contract.
-    const msg = "\x0a\x08Research\x12\x08Zig docs\x1a\x0bziglang.org";
+fn expectUpdate(msg: []const u8, group: []const u8, title: []const u8, domain: []const u8) !void {
     const update = decodeFocusUpdate(msg).?;
-    try testing.expectEqualStrings("Research", update.tab_group);
-    try testing.expectEqualStrings("Zig docs", update.tab_title);
-    try testing.expectEqualStrings("ziglang.org", update.domain);
-
-    // Empty group, unknown extra varint field (3 << 3 | 0), title only.
-    const msg2 = "\x18\x2a\x12\x05Hello";
-    const update2 = decodeFocusUpdate(msg2).?;
-    try testing.expectEqualStrings("", update2.tab_group);
-    try testing.expectEqualStrings("Hello", update2.tab_title);
-
-    // Truncated length prefix must fail, not crash.
-    try testing.expect(decodeFocusUpdate("\x0a\xff") == null);
+    try testing.expectEqualStrings(group, update.tab_group);
+    try testing.expectEqualStrings(title, update.tab_title);
+    try testing.expectEqualStrings(domain, update.domain);
 }
 
-test "decodeFocusUpdate: empty message yields empty fields" {
-    const update = decodeFocusUpdate("").?;
-    try testing.expectEqualStrings("", update.tab_group);
-    try testing.expectEqualStrings("", update.tab_title);
-    try testing.expectEqualStrings("", update.domain);
+test decodeFocusUpdate {
+    try expectUpdate("\x0a\x08Research\x12\x08Zig docs\x1a\x0bziglang.org", "Research", "Zig docs", "ziglang.org");
+    try expectUpdate("\x18\x2a\x12\x05Hello", "", "Hello", "");
+    try expectUpdate("", "", "", "");
+    try expectUpdate("\x0a\x00\x12\x00\x1a\x00", "", "", "");
+    try expectUpdate("\x25\x01\x02\x03\x04\x12\x02hi", "", "hi", "");
+    try expectUpdate("\x29\x01\x02\x03\x04\x05\x06\x07\x08\x12\x02hi", "", "hi", "");
+
+    var long: [3 + 300]u8 = undefined;
+    long[0..3].* = .{ 0x12, 0xac, 0x02 };
+    @memset(long[3..], 'x');
+    try testing.expectEqual(300, decodeFocusUpdate(&long).?.tab_title.len);
 }
 
-test "decodeFocusUpdate: zero-length string fields are valid" {
-    // field 1 len 0, field 2 len 0, field 3 len 0
-    const update = decodeFocusUpdate("\x0a\x00\x12\x00\x1a\x00").?;
-    try testing.expectEqualStrings("", update.tab_group);
-    try testing.expectEqualStrings("", update.tab_title);
+test "decodeFocusUpdate: rejects malformed input" {
+    for ([_][]const u8{
+        "\x0a\xff",
+        "\x12\xc8\x01abc",
+        "\x25\x01\x02",
+        "\x29\x01\x02\x03",
+        "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+    }) |msg| try testing.expect(decodeFocusUpdate(msg) == null);
 }
 
-test "decodeFocusUpdate: multi-byte varint length" {
-    // A 300-byte title: tag 0x12, varint length 300 = 0xAC 0x02.
-    var buf: [3 + 300]u8 = undefined;
-    buf[0] = 0x12;
-    buf[1] = 0xac;
-    buf[2] = 0x02;
-    @memset(buf[3..], 'x');
-    const update = decodeFocusUpdate(&buf).?;
-    try testing.expectEqual(@as(usize, 300), update.tab_title.len);
-}
-
-test "decodeFocusUpdate: rejects a length running past the buffer" {
-    // Claims 200 bytes of payload but only supplies 3.
-    try testing.expect(decodeFocusUpdate("\x12\xc8\x01abc") == null);
-}
-
-test "decodeFocusUpdate: skips unknown fixed32/fixed64 fields" {
-    // field 4 fixed32 (4<<3|5 = 0x25), then field 2 string.
-    const with32 = "\x25\x01\x02\x03\x04\x12\x02hi";
-    try testing.expectEqualStrings("hi", decodeFocusUpdate(with32).?.tab_title);
-
-    // field 5 fixed64 (5<<3|1 = 0x29), then field 2 string.
-    const with64 = "\x29\x01\x02\x03\x04\x05\x06\x07\x08\x12\x02hi";
-    try testing.expectEqualStrings("hi", decodeFocusUpdate(with64).?.tab_title);
-}
-
-test "decodeFocusUpdate: truncated fixed-width field fails cleanly" {
-    try testing.expect(decodeFocusUpdate("\x25\x01\x02") == null); // fixed32, 2 bytes left
-    try testing.expect(decodeFocusUpdate("\x29\x01\x02\x03") == null); // fixed64, 4 bytes left
-}
-
-test "decodeFocusUpdate: rejects an over-long varint" {
-    // Ten continuation bytes: malformed, must not loop or overflow the shift.
-    try testing.expect(decodeFocusUpdate("\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff") == null);
-}
-
-test "readVarint: boundary values" {
+test readVarint {
+    for ([_]struct { []const u8, u64 }{ .{ "\x00", 0 }, .{ "\x7f", 127 }, .{ "\x80\x01", 128 }, .{ "\xac\x02", 300 } }) |c| {
+        var i: usize = 0;
+        try testing.expectEqual(c[1], readVarint(c[0], &i).?);
+    }
     var i: usize = 0;
-    i = 0;
-    try testing.expectEqual(@as(u64, 0), readVarint("\x00", &i).?);
-    i = 0;
-    try testing.expectEqual(@as(u64, 127), readVarint("\x7f", &i).?);
-    i = 0;
-    try testing.expectEqual(@as(u64, 128), readVarint("\x80\x01", &i).?);
-    i = 0;
-    try testing.expectEqual(@as(u64, 300), readVarint("\xac\x02", &i).?);
-    // Runs off the end of the buffer.
-    i = 0;
     try testing.expect(readVarint("\x80", &i) == null);
 }
 
-test "completeRequest: returns null until headers and body are complete" {
-    // Headers not terminated yet.
+test completeRequest {
     try testing.expect(completeRequest("POST /x HTTP/1.1\r\nContent-Length: 5\r\n") == null);
-    // Headers complete but body short.
     try testing.expect(completeRequest("POST /x HTTP/1.1\r\nContent-Length: 5\r\n\r\nab") == null);
-}
 
-test "completeRequest: parses path and body" {
-    const raw = "POST " ++ method_path ++ " HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
-    const req = completeRequest(raw).?;
+    const req = completeRequest("POST " ++ method_path ++ " HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello").?;
     try testing.expectEqualStrings(method_path, req.path);
     try testing.expectEqualStrings("hello", req.body);
+    try testing.expectEqualStrings("abc", completeRequest("POST /p HTTP/1.1\r\ncOnTeNt-LeNgTh:  3\r\n\r\nabc").?.body);
+
+    const get = completeRequest("GET /p HTTP/1.1\r\nHost: x\r\n\r\n").?;
+    try testing.expectEqualStrings("/p", get.path);
+    try testing.expectEqualStrings("", get.body);
 }
 
-test "completeRequest: Content-Length header is case-insensitive" {
-    const raw = "POST /p HTTP/1.1\r\ncOnTeNt-LeNgTh:  3\r\n\r\nabc";
-    const req = completeRequest(raw).?;
-    try testing.expectEqualStrings("abc", req.body);
-}
-
-test "completeRequest: missing Content-Length means an empty body" {
-    const req = completeRequest("GET /p HTTP/1.1\r\nHost: x\r\n\r\n").?;
-    try testing.expectEqualStrings("/p", req.path);
-    try testing.expectEqualStrings("", req.body);
-}
-
-test "handleRpc: accepts a well-formed gRPC-Web frame on the right path" {
+test handleRpc {
     const payload = "\x0a\x04Work\x12\x03Zig\x1a\x07zig.org";
-    var body: [5 + payload.len]u8 = undefined;
-    body[0] = 0; // uncompressed data frame
-    std.mem.writeInt(u32, body[1..5], payload.len, .big);
-    @memcpy(body[5..], payload);
-
-    try testing.expect(handleRpc(.{ .path = method_path, .body = &body }));
-
-    // The decoded snapshot is what the tracker will report.
+    const body = [_]u8{0} ++ std.mem.toBytes(std.mem.nativeToBig(u32, payload.len)) ++ payload;
+    try testing.expect(handleRpc(.{ .path = method_path, .body = body }));
     var buf: [256]u8 = undefined;
     try testing.expectEqualStrings("chrome [Work] zig.org", chromeContext(&buf).?);
+
+    try testing.expect(!handleRpc(.{ .path = "/wrong/Path", .body = "\x00\x00\x00\x00\x00" }));
+    for ([_][]const u8{ "", "\x01\x00\x00\x00\x00", "\x00\x00\x00\x00\x64ab" }) |b| {
+        try testing.expect(!handleRpc(.{ .path = method_path, .body = b }));
+    }
 }
 
-test "handleRpc: rejects the wrong method path" {
-    const body = "\x00\x00\x00\x00\x00";
-    try testing.expect(!handleRpc(.{ .path = "/wrong/Path", .body = body }));
+test "response frames an empty Ack plus grpc-status trailers" {
+    const resp = comptime response("0");
+    const body = resp[std.mem.indexOf(u8, resp, "\r\n\r\n").? + 4 ..];
+    try testing.expectEqualStrings("\x00\x00\x00\x00\x00\x80\x00\x00\x00\x10grpc-status: 0\r\n", body);
+    try testing.expect(std.mem.indexOf(u8, resp, "Content-Length: 26\r\n") != null);
 }
 
-test "handleRpc: rejects malformed frames" {
-    try testing.expect(!handleRpc(.{ .path = method_path, .body = "" })); // too short
-    try testing.expect(!handleRpc(.{ .path = method_path, .body = "\x01\x00\x00\x00\x00" })); // compressed flag
-    // Length prefix longer than the actual payload.
-    try testing.expect(!handleRpc(.{ .path = method_path, .body = "\x00\x00\x00\x00\x64ab" }));
-}
-
-test "chromeContext: prefers domain, falls back to title, formats groups" {
+test chromeContext {
     var buf: [256]u8 = undefined;
-
-    // Ungrouped tab with a domain.
     storeSnapshot("", "Some Page Title", "example.com");
     try testing.expectEqualStrings("chrome: example.com", chromeContext(&buf).?);
-
-    // Grouped tab with a domain.
     storeSnapshot("Research", "Some Page Title", "example.com");
     try testing.expectEqualStrings("chrome [Research] example.com", chromeContext(&buf).?);
-
-    // No domain (chrome:// page): fall back to the title.
     storeSnapshot("", "Settings", "");
     try testing.expectEqualStrings("chrome: Settings", chromeContext(&buf).?);
-
-    // Nothing usable at all.
     storeSnapshot("", "", "");
     try testing.expect(chromeContext(&buf) == null);
 }
 
-test "copyValidUtf8: truncates without splitting a UTF-8 sequence" {
+test copyValidUtf8 {
     var dst: [4]u8 = undefined;
-    // "é" is 2 bytes; 3 of them do not fit in 4 bytes cleanly at the boundary.
     const n = copyValidUtf8(&dst, "ééé");
+    try testing.expectEqual(4, n);
     try testing.expect(std.unicode.utf8ValidateSlice(dst[0..n]));
-    try testing.expectEqual(@as(usize, 4), n);
-
-    // A lone continuation byte can never be valid, so nothing is copied.
-    var dst2: [8]u8 = undefined;
-    try testing.expectEqual(@as(usize, 0), copyValidUtf8(&dst2, "\x80"));
-}
-
-test "copyValidUtf8: copies short ASCII wholesale" {
-    var dst: [64]u8 = undefined;
-    const n = copyValidUtf8(&dst, "hello");
-    try testing.expectEqualStrings("hello", dst[0..n]);
+    try testing.expectEqual(0, copyValidUtf8(&dst, "\x80"));
+    try testing.expectEqualStrings("hi", dst[0..copyValidUtf8(&dst, "hi")]);
 }

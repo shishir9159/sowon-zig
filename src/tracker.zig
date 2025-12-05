@@ -5,33 +5,22 @@ const server = @import("server.zig");
 pub const Tracker = struct {
     map: std.StringHashMap(u64),
 
-    pub const Entry = struct {
-        name: []const u8,
-        seconds: u64,
-    };
+    pub const Entry = struct { name: []const u8, seconds: u64 };
 
     pub fn init(alloc: std.mem.Allocator) Tracker {
-        return .{ .map = std.StringHashMap(u64).init(alloc) };
+        return .{ .map = .init(alloc) };
     }
 
-    /// Credits `seconds` to the current foreground app and returns the
-    /// (map-owned, stable) usage key it was counted under.
     pub fn sample(self: *Tracker, seconds: u64) ![]const u8 {
         var buf: [512]u8 = undefined;
         var chrome_buf: [700]u8 = undefined;
         var name = foregroundAppName(&buf);
-
-        // With the bell-bearer extension connected, split Chrome time
-        // by tab group and site instead of lumping it together.
         if (std.ascii.eqlIgnoreCase(name, "chrome.exe")) {
             if (server.chromeContext(&chrome_buf)) |ctx| name = ctx;
         }
-
         return self.add(name, seconds);
     }
 
-    /// Credits `seconds` to `name` directly (also used to fold one
-    /// session's totals into the whole-run aggregate).
     pub fn add(self: *Tracker, name: []const u8, seconds: u64) ![]const u8 {
         const gop = try self.map.getOrPut(name);
         if (!gop.found_existing) {
@@ -45,9 +34,9 @@ pub const Tracker = struct {
     pub fn sortedEntries(self: *const Tracker, alloc: std.mem.Allocator) ![]Entry {
         const out = try alloc.alloc(Entry, self.map.count());
         var it = self.map.iterator();
-        var i: usize = 0;
-        while (it.next()) |kv| : (i += 1) {
-            out[i] = .{ .name = kv.key_ptr.*, .seconds = kv.value_ptr.* };
+        for (out) |*e| {
+            const kv = it.next().?;
+            e.* = .{ .name = kv.key_ptr.*, .seconds = kv.value_ptr.* };
         }
         std.mem.sort(Entry, out, {}, moreUsed);
         return out;
@@ -60,7 +49,6 @@ pub const Tracker = struct {
 
 fn foregroundAppName(buf: []u8) []const u8 {
     const hwnd = w32.GetForegroundWindow() orelse return "(no focused window)";
-
     var pid: w32.DWORD = 0;
     _ = w32.GetWindowThreadProcessId(hwnd, &pid);
     if (pid == 0) return "(unknown)";
@@ -72,12 +60,7 @@ fn foregroundAppName(buf: []u8) []const u8 {
     var len: w32.DWORD = path_buf.len;
     if (w32.QueryFullProcessImageNameW(proc, 0, &path_buf, &len) == 0) return "(unknown)";
     const path = path_buf[0..len];
-
-    var base_start: usize = 0;
-    for (path, 0..) |c, i| {
-        if (c == '\\' or c == '/') base_start = i + 1;
-    }
-
-    const n = std.unicode.utf16LeToUtf8(buf, path[base_start..]) catch return "(unknown)";
+    const base = if (std.mem.lastIndexOfAny(u16, path, &.{ '\\', '/' })) |i| path[i + 1 ..] else path;
+    const n = std.unicode.utf16LeToUtf8(buf, base) catch return "(unknown)";
     return buf[0..n];
 }

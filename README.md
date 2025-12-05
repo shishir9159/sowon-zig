@@ -94,14 +94,14 @@ Notes:
   land on `PATH`:
 
   ```powershell
-  spirv-val  .\zig-cache\o\<hash>\sprite.spv   # validate the module
-  spirv-dis  .\zig-cache\o\<hash>\sprite.spv   # human-readable SPIR-V
+  spirv-val  .\.zig-cache\o\<hash>\sprite.spv   # validate the module
+  spirv-dis  .\.zig-cache\o\<hash>\sprite.spv   # human-readable SPIR-V
   ```
 
 ### Zig 0.16 SPIR-V caveats
 
-Two compiler bugs are worked around in `build.zig`; both are pinned there with
-comments so they can be lifted when upstream fixes them:
+Two compiler bugs are worked around in `build.zig` (see the comment on the
+shader step) so they can be lifted when upstream fixes them:
 
 1. **Shaders must be built in `Debug`.** Every release mode
    (`ReleaseFast`/`ReleaseSafe`/`ReleaseSmall`) crashes the SPIR-V backend and

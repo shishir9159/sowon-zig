@@ -1,27 +1,26 @@
-//! Renderer-agnostic frame description. main.zig computes WHAT to draw
-//! (digit columns, wiggle rows, tint, report lines); the selected
-//! backend decides HOW. Every backend consumes exactly this interface:
-//!
-//!   pub fn init() !void
-//!   pub fn paint(hwnd: w32.HWND, view: frame.View) void
-//!   pub fn reportVisibleLines(height: i32) i32
+const std = @import("std");
 
-pub const chars_count = 8; // HH:MM:SS
+pub const chars_count = 8;
+pub const report_top_margin: i32 = 24;
 
 pub const Tint = enum { normal, paused, brk };
 
+pub fn tintRgb(tint: Tint) [3]u8 {
+    return switch (tint) {
+        .normal => .{ 220, 220, 220 },
+        .paused => .{ 220, 120, 120 },
+        .brk => .{ 130, 210, 150 },
+    };
+}
+
 pub const ClockFace = struct {
-    /// Sprite-sheet column per character (0-9, or the colon column).
     columns: [chars_count]u8,
-    /// Wiggle row per character.
     rows: [chars_count]u8,
     tint: Tint,
 };
 
 pub const ReportView = struct {
     lines: []const [:0]const u16,
-    /// First visible line; the renderer clamps it against the current
-    /// window size (line metrics are backend knowledge).
     scroll: *i32,
 };
 
@@ -29,3 +28,11 @@ pub const View = union(enum) {
     clock: ClockFace,
     report: ReportView,
 };
+
+pub fn reportLineHeight(height: i32) i32 {
+    return std.math.clamp(@divTrunc(height, 18), 18, 44);
+}
+
+pub fn reportVisibleLines(height: i32) i32 {
+    return @max(@divTrunc(height - report_top_margin, reportLineHeight(height)), 1);
+}

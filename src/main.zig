@@ -719,76 +719,65 @@ fn wndProc(hwnd: w32.HWND, msg: w32.UINT, wparam: w32.WPARAM, lparam: w32.LPARAM
     }
 }
 
-/// Writes report/history output to real stdout (so it can be piped or
-/// redirected), not stderr.
-fn writeStdout(io: std.Io, bytes: []const u8) void {
-    std.Io.File.stdout().writeStreamingAll(io, bytes) catch {};
+fn isFlag(arg: []const u8, short: []const u8, long: []const u8) bool {
+    return std.mem.eql(u8, arg, short) or std.mem.eql(u8, arg, long);
 }
 
-/// `sowon history [N]` — print recent sessions and exit.
-fn runHistory(alloc: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) void {
-    var limit: u32 = 15;
-    if (args.len >= 3) limit = std.fmt.parseInt(u32, args[2], 10) catch usageAndExit();
-    var d = db.Db.open() orelse return;
+fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) !bool {
     var aw = std.Io.Writer.Allocating.init(alloc);
-    d.printHistory(&aw.writer, limit);
-    writeStdout(io, aw.written());
-}
-
-/// `sowon report today|week [-t tag]` — print aggregates and exit.
-fn runReport(alloc: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) void {
-    var range: db.Db.Range = .today;
-    var tag: []const u8 = "";
-    var i: usize = 2;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "today")) {
-            range = .today;
-        } else if (std.mem.eql(u8, args[i], "week")) {
-            range = .week;
-        } else if (std.mem.eql(u8, args[i], "-t") or std.mem.eql(u8, args[i], "--tag")) {
-            i += 1;
-            if (i >= args.len) usageAndExit();
-            tag = args[i];
-        } else {
-            usageAndExit();
-        }
+    const w = &aw.writer;
+    const cmd = std.meta.stringToEnum(enum { history, report, allow }, args[1]) orelse return false;
+    switch (cmd) {
+        .history => {
+            const limit = if (args.len >= 3) (std.fmt.parseInt(u32, args[2], 10) catch usageAndExit()) else 15;
+            var d = db.Db.open() orelse return true;
+            try d.printHistory(w, limit);
+        },
+        .report => {
+            var range: db.Db.Range = .today;
+            var tag: []const u8 = "";
+            var i: usize = 2;
+            while (i < args.len) : (i += 1) {
+                if (std.meta.stringToEnum(db.Db.Range, args[i])) |r| {
+                    range = r;
+                } else if (isFlag(args[i], "-t", "--tag") and i + 1 < args.len) {
+                    i += 1;
+                    tag = args[i];
+                } else usageAndExit();
+            }
+            var d = db.Db.open() orelse return true;
+            try d.printReport(w, range, tag);
+        },
+        .allow => {
+            if (args.len < 3) usageAndExit();
+            const sub = std.meta.stringToEnum(enum { list, add, remove }, args[2]) orelse usageAndExit();
+            if (sub != .list and args.len < 4) usageAndExit();
+            var d = db.Db.open() orelse return true;
+            switch (sub) {
+                .list => {
+                    const list = d.loadAllow(alloc);
+                    for (list) |p| try w.print("  {s}\n", .{p});
+                    if (list.len == 0) try w.writeAll("(allow list is empty)\n");
+                },
+                .add => {
+                    d.allowAdd(args[3]);
+                    try w.writeAll("added\n");
+                },
+                .remove => {
+                    d.allowRemove(args[3]);
+                    try w.writeAll("removed\n");
+                },
+            }
+        },
     }
-    var d = db.Db.open() orelse return;
-    var aw = std.Io.Writer.Allocating.init(alloc);
-    d.printReport(&aw.writer, range, tag);
-    writeStdout(io, aw.written());
-}
-
-/// `sowon allow list|add|remove [pattern]` — manage the saved allow list.
-fn runAllow(alloc: std.mem.Allocator, io: std.Io, args: []const [:0]const u8) void {
-    if (args.len < 3) usageAndExit();
-    var d = db.Db.open() orelse return;
-    const sub = args[2];
-    if (std.mem.eql(u8, sub, "list")) {
-        var aw = std.Io.Writer.Allocating.init(alloc);
-        d.printAllow(&aw.writer);
-        writeStdout(io, aw.written());
-    } else if (std.mem.eql(u8, sub, "add")) {
-        if (args.len < 4) usageAndExit();
-        d.allowAdd(args[3]);
-        writeStdout(io, "added\n");
-    } else if (std.mem.eql(u8, sub, "remove")) {
-        if (args.len < 4) usageAndExit();
-        d.allowRemove(args[3]);
-        writeStdout(io, "removed\n");
-    } else {
-        usageAndExit();
-    }
+    std.Io.File.stdout().writeStreamingAll(io, aw.written()) catch {};
+    return true;
 }
 
 pub fn main(init: std.process.Init) !void {
     const alloc = init.arena.allocator();
-    const io = init.io;
     const args = try init.minimal.args.toSlice(alloc);
-
-    if (args.len >= 2 and std.mem.eql(u8, args[1], "history")) return runHistory(alloc, io, args);
-    if (args.len >= 2 and std.mem.eql(u8, args[1], "report")) return runReport(alloc, io, args);
-    if (args.len >= 2 and std.mem.eql(u8, args[1], "allow")) return runAllow(alloc, io, args);
+    if (args.len >= 2 and try runCommand(alloc, init.io, args)) return;
 
     const cfg = parseArgs(alloc, args);
 

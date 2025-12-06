@@ -70,16 +70,13 @@ pub const PAINTSTRUCT = extern struct {
     rgbReserved: [32]u8,
 };
 
-// Window messages
 pub const WM_DESTROY: UINT = 0x0002;
 pub const WM_SIZE: UINT = 0x0005;
 pub const WM_PAINT: UINT = 0x000F;
-pub const WM_CLOSE: UINT = 0x0010;
 pub const WM_ERASEBKGND: UINT = 0x0014;
 pub const WM_KEYDOWN: UINT = 0x0100;
 pub const WM_TIMER: UINT = 0x0113;
 
-// Class / window styles
 pub const CS_VREDRAW: UINT = 0x0001;
 pub const CS_HREDRAW: UINT = 0x0002;
 pub const WS_OVERLAPPEDWINDOW: DWORD = 0x00CF0000;
@@ -92,11 +89,10 @@ pub const SIZE_MINIMIZED: WPARAM = 1;
 pub const WM_APP: UINT = 0x8000;
 pub const WM_LBUTTONUP: LPARAM = 0x0202;
 
-// Virtual keys
 pub const VK_ESCAPE: WPARAM = 0x1B;
 pub const VK_SPACE: WPARAM = 0x20;
-pub const VK_PRIOR: WPARAM = 0x21; // Page Up
-pub const VK_NEXT: WPARAM = 0x22; // Page Down
+pub const VK_PRIOR: WPARAM = 0x21;
+pub const VK_NEXT: WPARAM = 0x22;
 pub const VK_END: WPARAM = 0x23;
 pub const VK_HOME: WPARAM = 0x24;
 pub const VK_UP: WPARAM = 0x26;
@@ -105,14 +101,12 @@ pub const VK_F5: WPARAM = 0x74;
 
 pub const WM_MOUSEWHEEL: UINT = 0x020A;
 
-// GDI
 pub const SRCCOPY: DWORD = 0x00CC0020;
 pub const TRANSPARENT: c_int = 1;
 pub const FW_NORMAL: c_int = 400;
 pub const DEFAULT_CHARSET: DWORD = 1;
 pub const CLEARTYPE_QUALITY: DWORD = 5;
 
-// DIB / AlphaBlend
 pub const BITMAPINFOHEADER = extern struct {
     biSize: DWORD,
     biWidth: i32,
@@ -144,12 +138,10 @@ pub const DIB_RGB_COLORS: UINT = 0;
 pub const AC_SRC_OVER: u8 = 0;
 pub const AC_SRC_ALPHA: u8 = 1;
 
-// PlaySound
 pub const SND_ASYNC: DWORD = 0x0001;
 pub const SND_NODEFAULT: DWORD = 0x0002;
 pub const SND_MEMORY: DWORD = 0x0004;
 
-// Process access
 pub const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
 
 pub const IDC_ARROW: u16 = 32512;
@@ -158,22 +150,8 @@ pub fn makeIntResourceW(id: u16) [*:0]const u16 {
     return @ptrFromInt(id);
 }
 
-// user32
 pub extern "user32" fn RegisterClassExW(*const WNDCLASSEXW) callconv(.winapi) ATOM;
-pub extern "user32" fn CreateWindowExW(
-    dwExStyle: DWORD,
-    lpClassName: [*:0]const u16,
-    lpWindowName: [*:0]const u16,
-    dwStyle: DWORD,
-    x: c_int,
-    y: c_int,
-    nWidth: c_int,
-    nHeight: c_int,
-    hWndParent: ?HWND,
-    hMenu: ?HMENU,
-    hInstance: ?HINSTANCE,
-    lpParam: ?*anyopaque,
-) callconv(.winapi) ?HWND;
+pub extern "user32" fn CreateWindowExW(DWORD, [*:0]const u16, [*:0]const u16, DWORD, c_int, c_int, c_int, c_int, ?HWND, ?HMENU, ?HINSTANCE, ?*anyopaque) callconv(.winapi) ?HWND;
 pub extern "user32" fn DefWindowProcW(HWND, UINT, WPARAM, LPARAM) callconv(.winapi) LRESULT;
 pub extern "user32" fn ShowWindow(HWND, c_int) callconv(.winapi) BOOL;
 pub extern "user32" fn GetMessageW(*MSG, ?HWND, UINT, UINT) callconv(.winapi) BOOL;
@@ -188,12 +166,10 @@ pub extern "user32" fn GetClientRect(HWND, *RECT) callconv(.winapi) BOOL;
 pub extern "user32" fn InvalidateRect(HWND, ?*const RECT, BOOL) callconv(.winapi) BOOL;
 pub extern "user32" fn FillRect(HDC, *const RECT, HBRUSH) callconv(.winapi) c_int;
 pub extern "user32" fn SetTimer(?HWND, usize, UINT, ?*anyopaque) callconv(.winapi) usize;
-pub extern "user32" fn KillTimer(?HWND, usize) callconv(.winapi) BOOL;
 pub extern "user32" fn SetWindowTextW(HWND, [*:0]const u16) callconv(.winapi) BOOL;
 pub extern "user32" fn GetForegroundWindow() callconv(.winapi) ?HWND;
 pub extern "user32" fn GetWindowThreadProcessId(HWND, ?*DWORD) callconv(.winapi) DWORD;
 
-// gdi32
 pub extern "gdi32" fn CreateSolidBrush(COLORREF) callconv(.winapi) ?HBRUSH;
 pub extern "gdi32" fn DeleteObject(HGDIOBJ) callconv(.winapi) BOOL;
 pub extern "gdi32" fn CreateCompatibleDC(?HDC) callconv(.winapi) ?HDC;
@@ -204,48 +180,10 @@ pub extern "gdi32" fn BitBlt(HDC, c_int, c_int, c_int, c_int, HDC, c_int, c_int,
 pub extern "gdi32" fn SetBkMode(HDC, c_int) callconv(.winapi) c_int;
 pub extern "gdi32" fn SetTextColor(HDC, COLORREF) callconv(.winapi) COLORREF;
 pub extern "gdi32" fn TextOutW(HDC, c_int, c_int, [*]const u16, c_int) callconv(.winapi) BOOL;
-pub extern "gdi32" fn CreateFontW(
-    cHeight: c_int,
-    cWidth: c_int,
-    cEscapement: c_int,
-    cOrientation: c_int,
-    cWeight: c_int,
-    bItalic: DWORD,
-    bUnderline: DWORD,
-    bStrikeOut: DWORD,
-    iCharSet: DWORD,
-    iOutPrecision: DWORD,
-    iClipPrecision: DWORD,
-    iQuality: DWORD,
-    iPitchAndFamily: DWORD,
-    pszFaceName: ?[*:0]const u16,
-) callconv(.winapi) ?HFONT;
+pub extern "gdi32" fn CreateFontW(c_int, c_int, c_int, c_int, c_int, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, ?[*:0]const u16) callconv(.winapi) ?HFONT;
+pub extern "gdi32" fn CreateDIBSection(?HDC, *const BITMAPINFO, UINT, *?*anyopaque, ?HANDLE, DWORD) callconv(.winapi) ?HBITMAP;
+pub extern "msimg32" fn AlphaBlend(HDC, c_int, c_int, c_int, c_int, HDC, c_int, c_int, c_int, c_int, BLENDFUNCTION) callconv(.winapi) BOOL;
 
-pub extern "gdi32" fn CreateDIBSection(
-    hdc: ?HDC,
-    pbmi: *const BITMAPINFO,
-    usage: UINT,
-    ppvBits: *?*anyopaque,
-    hSection: ?HANDLE,
-    offset: DWORD,
-) callconv(.winapi) ?HBITMAP;
-
-// msimg32
-pub extern "msimg32" fn AlphaBlend(
-    hdcDest: HDC,
-    xoriginDest: c_int,
-    yoriginDest: c_int,
-    wDest: c_int,
-    hDest: c_int,
-    hdcSrc: HDC,
-    xoriginSrc: c_int,
-    yoriginSrc: c_int,
-    wSrc: c_int,
-    hSrc: c_int,
-    ftn: BLENDFUNCTION,
-) callconv(.winapi) BOOL;
-
-// kernel32
 pub const HMODULE = *opaque {};
 pub extern "kernel32" fn GetModuleHandleW(?[*:0]const u16) callconv(.winapi) ?HINSTANCE;
 pub extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
@@ -258,10 +196,8 @@ pub extern "kernel32" fn OpenProcess(DWORD, BOOL, DWORD) callconv(.winapi) ?HAND
 pub extern "kernel32" fn CloseHandle(HANDLE) callconv(.winapi) BOOL;
 pub extern "kernel32" fn QueryFullProcessImageNameW(HANDLE, DWORD, [*]u16, *DWORD) callconv(.winapi) BOOL;
 
-// winmm
 pub extern "winmm" fn PlaySoundW(?*const anyopaque, ?HINSTANCE, DWORD) callconv(.winapi) BOOL;
 
-// Tray icon (Shell_NotifyIconW)
 pub const NOTIFYICONDATAW = extern struct {
     cbSize: DWORD,
     hWnd: ?HWND,
@@ -294,15 +230,12 @@ pub extern "shell32" fn Shell_NotifyIconW(DWORD, *NOTIFYICONDATAW) callconv(.win
 pub extern "user32" fn LoadIconW(?HINSTANCE, [*:0]const u16) callconv(.winapi) ?HICON;
 pub extern "user32" fn SetForegroundWindow(HWND) callconv(.winapi) BOOL;
 
-// Idle detection: dwTime is a 32-bit GetTickCount() stamp of the last
-// keyboard/mouse input; idle_ms = GetTickCount() - dwTime.
 pub const LASTINPUTINFO = extern struct {
     cbSize: UINT,
     dwTime: DWORD,
 };
 pub extern "user32" fn GetLastInputInfo(*LASTINPUTINFO) callconv(.winapi) BOOL;
 
-// Taskbar attention flash
 pub const FLASHWINFO = extern struct {
     cbSize: UINT,
     hwnd: ?HWND,
@@ -313,13 +246,11 @@ pub const FLASHWINFO = extern struct {
 pub const FLASHW_ALL: DWORD = 3;
 pub extern "user32" fn FlashWindowEx(*const FLASHWINFO) callconv(.winapi) BOOL;
 
-// Slim reader/writer lock (used exclusively; a plain mutex)
 pub const SRWLOCK = usize;
 pub const SRWLOCK_INIT: SRWLOCK = 0;
 pub extern "kernel32" fn AcquireSRWLockExclusive(*SRWLOCK) callconv(.winapi) void;
 pub extern "kernel32" fn ReleaseSRWLockExclusive(*SRWLOCK) callconv(.winapi) void;
 
-// winsock
 pub const SOCKET = usize;
 pub const INVALID_SOCKET: SOCKET = ~@as(SOCKET, 0);
 pub const AF_INET: u16 = 2;
@@ -328,12 +259,11 @@ pub const IPPROTO_TCP: c_int = 6;
 
 pub const sockaddr_in = extern struct {
     sin_family: u16,
-    sin_port: u16, // big-endian
-    sin_addr: u32, // network byte order in memory
+    sin_port: u16,
+    sin_addr: u32,
     sin_zero: [8]u8,
 };
 
-// setsockopt: SO_RCVTIMEO takes a DWORD timeout in milliseconds.
 pub const SOL_SOCKET: c_int = 0xffff;
 pub const SO_RCVTIMEO: c_int = 0x1006;
 
